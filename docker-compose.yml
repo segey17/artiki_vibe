@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./photos:/app/photos        # <-- кладите сюда свои 20к фото
+      - ./data:/app/data            # SQLite БД
+    environment:
+      - JWT_SECRET=ЗАМЕНИТЕ_НА_СЛУЧАЙНУЮ_СТРОКУ_МИНИМУМ_32_СИМВОЛА
+    restart: unless-stopped
