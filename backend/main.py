@@ -72,8 +72,22 @@ def init_db():
     INSERT OR IGNORE INTO settings VALUES ('current_photo_id', NULL);
     INSERT OR IGNORE INTO settings VALUES ('voting_open', '1');
     INSERT OR IGNORE INTO settings VALUES ('tiers', NULL);
+    CREATE TABLE IF NOT EXISTS tags (
+        id INTEGER PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        category INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name);
+    CREATE TABLE IF NOT EXISTS photo_tags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        photo_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        tag_id INTEGER NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(photo_id, user_id, tag_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_photo_tags_photo ON photo_tags(photo_id);
     """)
-    # migrate old ratings table if needed (score -> tier_id)
     cols = [r[1] for r in db.execute("PRAGMA table_info(ratings)").fetchall()]
     if 'score' in cols and 'tier_id' not in cols:
         db.execute("ALTER TABLE ratings ADD COLUMN tier_id TEXT")
@@ -81,6 +95,16 @@ def init_db():
         for row in db.execute("SELECT id, score FROM ratings").fetchall():
             db.execute("UPDATE ratings SET tier_id=? WHERE id=?",
                        (score_to_tier.get(row['score'],'C'), row['id']))
+    if db.execute("SELECT COUNT(*) FROM tags").fetchone()[0] == 0:
+        import csv
+        tags_path = "/app/tags.csv"
+        if os.path.exists(tags_path):
+            with open(tags_path, newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                batch = [(int(r['tag_id']), r['name'], int(r['category']))
+                         for r in reader if r['name'] and r['category'] in ('0','4','9')]
+            db.executemany("INSERT OR IGNORE INTO tags (id,name,category) VALUES (?,?,?)", batch)
+            print(f"Loaded {len(batch)} tags")
     db.commit()
     db.close()
 
@@ -274,6 +298,58 @@ def rate_photo(photo_id: int = Form(...), tier_id: str = Form(...), user=Depends
     return {"ok": True}
 
 
+@app.get("/api/tags/search")
+def search_tags(q: str = "", limit: int = 20, user=Depends(current_user)):
+    db = get_db()
+    q = q.strip().replace("_", " ")
+    pattern = "%" + q.replace("%","").replace("_","\_") + "%"
+    rows = db.execute(
+        "SELECT id, name, category FROM tags WHERE name LIKE ? ESCAPE '\\' ORDER BY length(name), name LIMIT ?",
+        (pattern, min(limit, 50))).fetchall()
+    db.close()
+    return [{"id": r["id"], "name": r["name"], "category": r["category"]} for r in rows]
+
+@app.get("/api/photo-tags/{photo_id}")
+def get_photo_tags(photo_id: int, user=Depends(current_user)):
+    db = get_db()
+    rows = db.execute("""
+        SELECT t.id as tag_id, t.name as tag_name, u.username, pt.user_id
+        FROM photo_tags pt
+        JOIN tags t ON t.id = pt.tag_id
+        JOIN users u ON u.id = pt.user_id
+        WHERE pt.photo_id = ?
+        ORDER BY t.name
+    """, (photo_id,)).fetchall()
+    db.close()
+    mine = [{"id": r["tag_id"], "name": r["tag_name"]} for r in rows if r["user_id"] == user["id"]]
+    all_tags = [{"tag_id": r["tag_id"], "tag_name": r["tag_name"], "username": r["username"]} for r in rows]
+    return {"mine": mine, "all": all_tags}
+
+@app.post("/api/photo-tags/{photo_id}/add")
+def add_photo_tag(photo_id: int, tag_name: str = Form(...), user=Depends(current_user)):
+    db = get_db()
+    # find by name (case-insensitive)
+    tag = db.execute("SELECT id FROM tags WHERE LOWER(name)=LOWER(?)", (tag_name.strip(),)).fetchone()
+    if not tag:
+        # allow adding if name exists in any form
+        db.close(); raise HTTPException(404, "Тег не найден")
+    try:
+        db.execute("INSERT INTO photo_tags (photo_id, user_id, tag_id) VALUES (?,?,?)",
+                   (photo_id, user["id"], tag["id"]))
+        db.commit()
+    except sqlite3.IntegrityError:
+        pass
+    db.close()
+    return {"ok": True}
+
+@app.delete("/api/photo-tags/{photo_id}/{tag_id}")
+def remove_photo_tag(photo_id: int, tag_id: int, user=Depends(current_user)):
+    db = get_db()
+    db.execute("DELETE FROM photo_tags WHERE photo_id=? AND user_id=? AND tag_id=?",
+               (photo_id, user["id"], tag_id))
+    db.commit(); db.close()
+    return {"ok": True}
+
 @app.get("/api/photo-votes/{photo_id}")
 def photo_votes(photo_id: int, user=Depends(current_user)):
     db = get_db()
@@ -290,6 +366,46 @@ def photo_votes(photo_id: int, user=Depends(current_user)):
              "tier_label": tier_map.get(r["tier_id"], {}).get("label", r["tier_id"]),
              "tier_color": tier_map.get(r["tier_id"], {}).get("color", "#888"),
              "created_at": r["created_at"]} for r in rows]
+
+
+@app.get("/api/photo-detail/{photo_id}")
+def photo_detail(photo_id: int, user=Depends(current_user)):
+    db = get_db()
+    tiers = get_tiers(db)
+    tier_map = {t["id"]: t for t in tiers}
+
+    # photo info
+    photo = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
+    if not photo:
+        db.close(); raise HTTPException(404)
+
+    # votes per user
+    votes = db.execute("""
+        SELECT u.username, r.tier_id
+        FROM ratings r JOIN users u ON u.id=r.user_id
+        WHERE r.photo_id=? ORDER BY u.username
+    """, (photo_id,)).fetchall()
+
+    # tags with user counts
+    tags = db.execute("""
+        SELECT t.name, COUNT(pt.user_id) as cnt,
+               GROUP_CONCAT(u.username, ', ') as users
+        FROM photo_tags pt
+        JOIN tags t ON t.id=pt.tag_id
+        JOIN users u ON u.id=pt.user_id
+        WHERE pt.photo_id=?
+        GROUP BY t.id ORDER BY cnt DESC, t.name
+    """, (photo_id,)).fetchall()
+
+    db.close()
+    return {
+        "photo": dict(photo),
+        "votes": [{"username": r["username"], "tier_id": r["tier_id"],
+                   "tier_label": tier_map.get(r["tier_id"], {}).get("label", r["tier_id"]),
+                   "tier_color": tier_map.get(r["tier_id"], {}).get("color", "#888")}
+                  for r in votes],
+        "tags": [{"name": r["name"], "count": r["cnt"], "users": r["users"]} for r in tags],
+    }
 
 # ── ADMIN NAV ─────────────────────────────────────────────────────────────────
 
@@ -380,6 +496,40 @@ def tierlist(user=Depends(current_user)):
 
     db.close()
     return {"tiers": result, "tier_order": tier_order, "tier_map": tier_map}
+
+
+@app.get("/api/photo-detail/{photo_id}")
+def photo_detail(photo_id: int, user=Depends(current_user)):
+    db = get_db()
+    tiers = get_tiers(db)
+    tier_map = {t["id"]: t for t in tiers}
+
+    # ratings with usernames
+    ratings = db.execute("""
+        SELECT u.username, r.tier_id
+        FROM ratings r JOIN users u ON u.id=r.user_id
+        WHERE r.photo_id=?
+        ORDER BY u.username
+    """, (photo_id,)).fetchall()
+
+    # tags with count
+    tags = db.execute("""
+        SELECT t.name, COUNT(*) as cnt, GROUP_CONCAT(u.username, ', ') as users
+        FROM photo_tags pt
+        JOIN tags t ON t.id=pt.tag_id
+        JOIN users u ON u.id=pt.user_id
+        WHERE pt.photo_id=?
+        GROUP BY t.id
+        ORDER BY cnt DESC, t.name
+    """, (photo_id,)).fetchall()
+
+    db.close()
+    return {
+        "ratings": [{"username": r["username"], "tier_id": r["tier_id"],
+                     "tier_label": tier_map.get(r["tier_id"],{}).get("label", r["tier_id"]),
+                     "tier_color": tier_map.get(r["tier_id"],{}).get("color","#888")} for r in ratings],
+        "tags": [{"name": t["name"], "count": t["cnt"], "users": t["users"]} for t in tags],
+    }
 
 @app.get("/api/stats")
 def stats(user=Depends(admin_user)):

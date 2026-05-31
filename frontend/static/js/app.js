@@ -71,6 +71,7 @@ async function loadCurrentPhoto() {
     const data = await req('GET', '/api/current-photo');
     if (data.tiers?.length) tiers = data.tiers;
     renderCurrentPhoto(data);
+    loadTags();
   } catch(e) { console.error(e); }
 }
 
@@ -296,9 +297,19 @@ function handleDrop(e){e.preventDefault();uploadFiles(e.dataTransfer.files);}
 function setUpProgress(p,l){document.getElementById('up-fill').style.width=p+'%';document.getElementById('up-label').textContent=l;}
 
 // ── TIERLIST ──────────────────────────────────────────────────────────────────
+// Cache tierlist data for export
+let tierlistData = null;
+
+function textColorFor(hex) {
+  const h = hex.replace('#','');
+  const r=parseInt(h.slice(0,2),16), g=parseInt(h.slice(2,4),16), b=parseInt(h.slice(4,6),16);
+  return (0.299*r+0.587*g+0.114*b)/255 > 0.55 ? '#1a1a1a' : '#ffffff';
+}
+
 async function loadTierlist() {
   try {
     const data = await req('GET','/api/tierlist');
+    tierlistData = data;
     const tierMap = data.tier_map || {};
     const container = document.getElementById('tierlist-container');
     let hasAny = false;
@@ -306,18 +317,14 @@ async function loadTierlist() {
       const photos = data.tiers[tid] || [];
       const info = tierMap[tid] || {label: tid, color: '#888'};
       if (photos.length) hasAny = true;
-      // text color: luminance-based
-      const hex = info.color.replace('#','');
-      const r=parseInt(hex.slice(0,2),16), g=parseInt(hex.slice(2,4),16), b=parseInt(hex.slice(4,6),16);
-      const lum = (0.299*r+0.587*g+0.114*b)/255;
-      const textColor = lum > 0.55 ? '#1a1a1a' : '#ffffff';
-      return `<div class="tier-row">
+      const textColor = textColorFor(info.color);
+      return `<div class="tier-row" data-tier="${tid}">
         <div class="tier-label" style="background:${info.color};color:${textColor}">
           <span class="tier-name-full">${info.label}</span>
         </div>
         <div class="tier-photos">
           ${photos.length
-            ? photos.map(p=>`<div class="tier-photo" title="${p.original_name||p.filename} (${p.vote_count} гол.)">
+            ? photos.map(p=>`<div class="tier-photo" onclick="openPhotoModal(${p.id},'${p.filename}')" title="Нажмите для просмотра">
                 <img src="/photos/${p.filename}" alt="" loading="lazy">
                 <div class="score-badge" style="background:${info.color};color:${textColor}">${p.vote_count}✓</div>
               </div>`).join('')
@@ -327,6 +334,115 @@ async function loadTierlist() {
     }).join('');
     document.getElementById('tierlist-empty').style.display = hasAny ? 'none' : '';
   } catch(e) { toast(e.message,'err'); }
+}
+
+// ── PHOTO MODAL ───────────────────────────────────────────────────────────────
+// ── EXPORT ────────────────────────────────────────────────────────────────────
+async function exportCSV() {
+  if (!tierlistData) { toast('Сначала загрузите тир-лист','err'); return; }
+  const tierMap = tierlistData.tier_map || {};
+  let csv = 'Тир,Название файла,Голосов\n';
+  tierlistData.tier_order.forEach(tid => {
+    const label = tierMap[tid]?.label || tid;
+    (tierlistData.tiers[tid] || []).forEach(p => {
+      csv += `"${label}","${(p.original_name||p.filename).replace(/"/g,'""')}","${p.vote_count}"\n`;
+    });
+  });
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'tierlist.csv';
+  a.click();
+}
+
+async function exportPNG() {
+  if (!tierlistData) { toast('Сначала загрузите тир-лист','err'); return; }
+  toast('Генерирую PNG...', '');
+
+  const tierMap = tierlistData.tier_map || {};
+  const THUMB = 80, PAD = 8, LABEL_W = 100, GAP = 4;
+
+  // calc rows
+  const rows = tierlistData.tier_order.map(tid => ({
+    tid, info: tierMap[tid]||{label:tid,color:'#888'},
+    photos: tierlistData.tiers[tid]||[]
+  })).filter(r => r.photos.length > 0);
+
+  // load all images
+  const loadImg = src => new Promise(res => {
+    const img = new Image(); img.crossOrigin='anonymous';
+    img.onload = () => res(img);
+    img.onerror = () => res(null);
+    img.src = src;
+  });
+
+  const allImgs = {};
+  await Promise.all(rows.flatMap(r => r.photos.map(async p => {
+    allImgs[p.filename] = await loadImg(`/photos/${p.filename}`);
+  })));
+
+  // canvas size
+  const maxPhotosPerRow = Math.max(...rows.map(r=>r.photos.length));
+  const rowH = THUMB + PAD*2;
+  const canvasW = LABEL_W + Math.min(maxPhotosPerRow, 12) * (THUMB+GAP) + PAD*2 + 40;
+  const canvasH = rows.length * (rowH + GAP) + 60;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = canvasW; canvas.height = canvasH;
+  const ctx = canvas.getContext('2d');
+
+  // background
+  ctx.fillStyle = '#0a0a0b';
+  ctx.fillRect(0, 0, canvasW, canvasH);
+
+  // title
+  ctx.fillStyle = '#f0f0f0';
+  ctx.font = 'bold 20px sans-serif';
+  ctx.fillText('Тир-лист результатов', PAD, 36);
+
+  let y = 52;
+  for (const row of rows) {
+    const tc = textColorFor(row.info.color);
+    // tier label bg
+    ctx.fillStyle = row.info.color;
+    ctx.beginPath();
+    ctx.roundRect(PAD, y, LABEL_W - PAD, rowH, 8);
+    ctx.fill();
+    // tier label text
+    ctx.fillStyle = tc;
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(row.info.label, PAD + (LABEL_W-PAD)/2, y + rowH/2 + 5);
+    ctx.textAlign = 'left';
+
+    // photos
+    let x = LABEL_W + PAD;
+    for (const p of row.photos.slice(0, 12)) {
+      const img = allImgs[p.filename];
+      if (img) {
+        // clip to rounded rect
+        ctx.save();
+        ctx.beginPath();
+        ctx.roundRect(x, y+PAD, THUMB, THUMB, 6);
+        ctx.clip();
+        // cover fit
+        const scale = Math.max(THUMB/img.width, THUMB/img.height);
+        const sw = img.width*scale, sh = img.height*scale;
+        ctx.drawImage(img, x+(THUMB-sw)/2, y+PAD+(THUMB-sh)/2, sw, sh);
+        ctx.restore();
+      }
+      x += THUMB + GAP;
+    }
+    y += rowH + GAP;
+  }
+
+  canvas.toBlob(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'tierlist.png';
+    a.click();
+    toast('PNG сохранён!', 'ok');
+  }, 'image/png');
 }
 
 
@@ -371,6 +487,213 @@ function tierTextColor(hex) {
   const r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
   return (0.299*r+0.587*g+0.114*b)/255 > 0.55 ? '#1a1a1a' : '#ffffff';
 }
+
+
+
+// ── PHOTO MODAL ───────────────────────────────────────────────────────────────
+
+async function openPhotoModal(photoId, filename) {
+  const modal = document.getElementById('photo-modal');
+  const img = document.getElementById('modal-img');
+  const fname = document.getElementById('modal-filename');
+  const votesEl = document.getElementById('modal-votes');
+  const tagsEl = document.getElementById('modal-tags');
+
+  img.src = `/photos/${filename}`;
+  fname.textContent = '';
+  votesEl.innerHTML = '<div class="modal-loading">Загрузка...</div>';
+  tagsEl.innerHTML = '';
+  modal.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+
+  try {
+    const d = await req('GET', `/api/photo-detail/${photoId}`);
+    fname.textContent = d.photo.original_name || d.photo.filename;
+
+    // votes
+    if (!d.votes.length) {
+      votesEl.innerHTML = '<div class="modal-empty">Нет оценок</div>';
+    } else {
+      votesEl.innerHTML = d.votes.map(v => {
+        const color = v.tier_color || '#888';
+        const textCol = tierTextColor(color.length === 7 ? color : '#888888');
+        return `<div class="modal-vote-row">
+          <span class="modal-tier-badge" style="background:${color};color:${textCol}">${v.tier_label || v.tier_id}</span>
+          <span class="modal-username">${v.username}</span>
+        </div>`;
+      }).join('');
+    }
+
+    // tags
+    if (!d.tags.length) {
+      tagsEl.innerHTML = '<div class="modal-empty">Нет тегов</div>';
+    } else {
+      tagsEl.innerHTML = d.tags.map(t => `
+        <span class="modal-tag" title="${t.users}">
+          ${t.name}
+          <span class="modal-tag-cnt">${t.count}</span>
+        </span>`).join('');
+    }
+  } catch(e) {
+    votesEl.innerHTML = '<div class="modal-empty">Ошибка загрузки</div>';
+  }
+}
+
+function closePhotoModal() {
+  document.getElementById('photo-modal').style.display = 'none';
+  document.body.style.overflow = '';
+}
+
+function closeModal(e) {
+  if (e.target === document.getElementById('photo-modal')) closePhotoModal();
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePhotoModal(); });
+
+// ── EXPORT ────────────────────────────────────────────────────────────────────
+
+async function exportPNG() {
+  toast('Генерация PNG...', '');
+  // Use html2canvas via CDN loaded dynamically
+  if (!window.html2canvas) {
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+      s.onload = res; s.onerror = rej;
+      document.head.appendChild(s);
+    });
+  }
+  const el = document.getElementById('tierlist-container');
+  try {
+    const canvas = await html2canvas(el, {
+      backgroundColor: '#0a0a0b',
+      scale: 2,
+      useCORS: true,
+      allowTaint: true,
+    });
+    const link = document.createElement('a');
+    link.download = 'tierlist.png';
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+    toast('PNG сохранён!', 'ok');
+  } catch(e) {
+    toast('Ошибка: ' + e.message, 'err');
+  }
+}
+
+async function exportCSV() {
+  try {
+    const data = await req('GET', '/api/tierlist');
+    const tierMap = data.tier_map || {};
+    const rows = [['Тир', 'Файл', 'Голосов']];
+    for (const tid of data.tier_order) {
+      const label = tierMap[tid]?.label || tid;
+      for (const p of (data.tiers[tid] || [])) {
+        rows.push([label, p.original_name || p.filename, p.vote_count]);
+      }
+    }
+    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+    const blob = new Blob(['\uFEFF' + csv], {type: 'text/csv;charset=utf-8'});
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'tierlist.csv';
+    link.click();
+    toast('CSV сохранён!', 'ok');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+// ── TAGS ──────────────────────────────────────────────────────────────────────
+let myTags = [];        // tag objects {id, name} set by current user
+let allPhotoTags = [];  // all users tags [{username, tag_name, tag_id}]
+let dropdownVisible = false;
+
+async function loadTags() {
+  if (!currentPhotoId) return;
+  try {
+    const data = await req('GET', `/api/photo-tags/${currentPhotoId}`);
+    allPhotoTags = data.all || [];
+    myTags = data.mine || [];
+    renderTags();
+  } catch(e) {}
+}
+
+function renderTags() {
+  const sel = document.getElementById('tags-selected');
+  if (!sel) return;
+
+  // my tags as removable chips
+  const myHtml = myTags.map(t => `
+    <span class="tag-chip mine" title="Нажмите чтобы удалить">
+      ${t.name}
+      <span class="tag-remove" onclick="removeTag(${t.id})">×</span>
+    </span>`).join('');
+
+  // other users' tags grouped
+  const others = {};
+  allPhotoTags.forEach(r => {
+    if (!others[r.tag_name]) others[r.tag_name] = [];
+    others[r.tag_name].push(r.username);
+  });
+  const myTagNames = new Set(myTags.map(t => t.name));
+  const othersHtml = Object.entries(others)
+    .filter(([name]) => !myTagNames.has(name))
+    .map(([name, users]) => `
+      <span class="tag-chip other" title="${users.join(', ')}: ${name}"
+            onclick="addTagByName('${name.replace(/'/g,"\'")}')">
+        ${name} <span class="tag-users">${users.length}</span>
+      </span>`).join('');
+
+  sel.innerHTML = myHtml + othersHtml;
+}
+
+function searchTags(q) {
+  const dropdown = document.getElementById('tags-dropdown');
+  if (!q.trim()) { dropdown.style.display = 'none'; return; }
+  const lower = q.toLowerCase().replace(/ /g,'_');
+  const results = ALL_TAGS
+    .filter(t => t.toLowerCase().includes(lower))
+    .slice(0, 30);
+  if (!results.length) { dropdown.style.display = 'none'; return; }
+  const myTagNames = new Set(myTags.map(t => t.name));
+  dropdown.innerHTML = results.map(t => `
+    <div class="tag-option ${myTagNames.has(t) ? 'already' : ''}"
+         onclick="addTagByName('${t.replace(/'/g,"\'")}')">
+      ${t}${myTagNames.has(t) ? ' ✓' : ''}
+    </div>`).join('');
+  dropdown.style.display = '';
+}
+
+function showDropdown() {
+  const q = document.getElementById('tags-input')?.value;
+  if (q) searchTags(q);
+}
+
+async function addTagByName(name) {
+  if (!currentPhotoId) return;
+  if (myTags.find(t => t.name === name)) return;
+  try {
+    await formReq(`/api/photo-tags/${currentPhotoId}/add`, {tag_name: name});
+    document.getElementById('tags-input').value = '';
+    document.getElementById('tags-dropdown').style.display = 'none';
+    await loadTags();
+  } catch(e) { toast(e.message || 'Ошибка', 'err'); }
+}
+
+async function removeTag(tagId) {
+  if (!currentPhotoId) return;
+  try {
+    await req('DELETE', `/api/photo-tags/${currentPhotoId}/${tagId}`);
+    await loadTags();
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+// close dropdown on outside click
+document.addEventListener('click', e => {
+  if (!e.target.closest('.tags-search-wrap')) {
+    const d = document.getElementById('tags-dropdown');
+    if (d) d.style.display = 'none';
+  }
+});
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 async function req(method, url, body) {

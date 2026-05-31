@@ -77,6 +77,15 @@
             </button>
             <div class="votes-list" id="votes-list" style="display:none"></div>
           </div>
+
+          <div class="tags-wrap">
+            <div class="tags-label">Теги</div>
+            <div class="tags-selected" id="tags-selected"></div>
+            <div class="tags-search-wrap">
+              <input class="tags-input" id="tags-input" placeholder="Поиск тега..." oninput="searchTags(this.value)" onfocus="showDropdown()" autocomplete="off">
+              <div class="tags-dropdown" id="tags-dropdown" style="display:none"></div>
+            </div>
+          </div>
         </div>
       </div>
       <div id="admin-controls" class="admin-bar" style="display:none">
@@ -101,8 +110,16 @@
       </nav>
     </header>
     <main class="tierlist-main">
-      <h1 class="tierlist-title">Тир-лист <span>результатов</span></h1>
-      <p class="tierlist-sub">По средней оценке всех пользователей</p>
+      <div class="tierlist-header">
+        <div>
+          <h1 class="tierlist-title">Тир-лист <span>результатов</span></h1>
+          <p class="tierlist-sub">По средней оценке всех пользователей</p>
+        </div>
+        <div class="export-btns">
+          <button class="btn-secondary" onclick="exportPNG()">🖼️ Сохранить PNG</button>
+          <button class="btn-secondary" onclick="exportCSV()">📄 Экспорт CSV</button>
+        </div>
+      </div>
       <div id="tierlist-container"></div>
       <div id="tierlist-empty" class="empty-state" style="display:none">
         <div style="font-size:3rem">⏳</div><p>Пока нет оценённых фотографий.</p>
@@ -169,7 +186,30 @@
   </div>
 </div>
 
+
+<!-- PHOTO MODAL -->
+<div id="photo-modal" class="modal-overlay" style="display:none" onclick="closeModal(event)">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closePhotoModal()">✕</button>
+    <div class="modal-layout">
+      <div class="modal-img-wrap">
+        <img id="modal-img" src="" alt="">
+      </div>
+      <div class="modal-info">
+        <div class="modal-filename" id="modal-filename"></div>
+
+        <div class="modal-section-title">Оценки участников</div>
+        <div id="modal-votes" class="modal-votes"></div>
+
+        <div class="modal-section-title" style="margin-top:12px">Теги</div>
+        <div id="modal-tags" class="modal-tags"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast"></div>
+<script src="/static/js/tags.js"></script>
 <script src="/static/js/app.js"></script>
 </body>
 </html>
