@@ -5,6 +5,8 @@ let currentPhotoId = null;
 let selectedTierId = null;
 let tiers = [];
 let pollTimer = null;
+let ws = null;
+let wsReconnectTimer = null;
 
 document.addEventListener('DOMContentLoaded', async () => {
   if (token) {
@@ -157,8 +159,47 @@ async function submitVote() {
   } catch(e) { toast(e.message || 'Ошибка', 'err'); }
 }
 
-function startPolling() { clearPolling(); pollTimer = setInterval(loadCurrentPhoto, 5000); }
-function clearPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+function startPolling() {
+  clearPolling();
+  // fallback polling (в случае если WS недоступен)
+  pollTimer = setInterval(loadCurrentPhoto, 15000);
+  connectWS();
+}
+
+function clearPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+}
+
+function connectWS() {
+  if (!token) return;
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+
+  ws.onopen = () => {
+    console.log('WS connected');
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'photo_change' || msg.type === 'voting_closed' || msg.type === 'vote_update') {
+        selectedTierId = null;
+        loadCurrentPhoto();
+      }
+    } catch {}
+  };
+
+  ws.onclose = () => {
+    console.log('WS disconnected, reconnecting in 3s...');
+    wsReconnectTimer = setTimeout(connectWS, 3000);
+  };
+
+  ws.onerror = () => { ws.close(); };
+}
 
 // ── ADMIN NAV ─────────────────────────────────────────────────────────────────
 async function nextPhoto() {

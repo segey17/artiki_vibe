@@ -1,9 +1,9 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, status
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import sqlite3, os, jwt, bcrypt, uuid, io, json
+import sqlite3, os, jwt, bcrypt, uuid, io, json, asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 from PIL import Image as PILImage
@@ -17,6 +17,41 @@ except ImportError:
 app = FastAPI(title="PhotoRank")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
+
+# ── WEBSOCKET MANAGER ─────────────────────────────────────────────────────────
+
+class WSManager:
+    def __init__(self):
+        self.connections: list[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.connections.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        self.connections.remove(ws) if ws in self.connections else None
+
+    async def broadcast(self, data: dict):
+        msg = json.dumps(data, ensure_ascii=False)
+        dead = []
+        for ws in self.connections:
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
+ws_manager = WSManager()
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws_manager.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()  # keep alive, ignore messages
+    except WebSocketDisconnect:
+        ws_manager.disconnect(ws)
 
 SECRET = os.getenv("JWT_SECRET", "change-me-in-production-please")
 PHOTOS_DIR = "/app/photos"
@@ -280,7 +315,7 @@ def current_photo(user=Depends(current_user)):
     }
 
 @app.post("/api/rate")
-def rate_photo(photo_id: int = Form(...), tier_id: str = Form(...), user=Depends(current_user)):
+async def rate_photo(photo_id: int = Form(...), tier_id: str = Form(...), user=Depends(current_user)):
     db = get_db()
     tiers = get_tiers(db)
     valid_ids = {t["id"] for t in tiers}
@@ -295,6 +330,7 @@ def rate_photo(photo_id: int = Form(...), tier_id: str = Form(...), user=Depends
         ON CONFLICT(photo_id, user_id) DO UPDATE SET tier_id=excluded.tier_id
     """, (photo_id, user["id"], tier_id))
     db.commit(); db.close()
+    await ws_manager.broadcast({"type": "vote_update", "photo_id": photo_id})
     return {"ok": True}
 
 
@@ -410,7 +446,7 @@ def photo_detail(photo_id: int, user=Depends(current_user)):
 # ── ADMIN NAV ─────────────────────────────────────────────────────────────────
 
 @app.post("/api/admin/next-photo")
-def next_photo(user=Depends(admin_user)):
+async def next_photo(user=Depends(admin_user)):
     db = get_db(); cur = get_setting(db, "current_photo_id")
     nxt = db.execute(
         "SELECT id FROM photos WHERE position>(SELECT position FROM photos WHERE id=?) ORDER BY position LIMIT 1",
@@ -418,10 +454,12 @@ def next_photo(user=Depends(admin_user)):
     if not nxt: db.close(); return {"done": True}
     set_setting(db, "current_photo_id", str(nxt["id"]))
     set_setting(db, "voting_open", "1")
-    db.close(); return {"done": False, "photo_id": nxt["id"]}
+    db.close()
+    await ws_manager.broadcast({"type": "photo_change", "photo_id": nxt["id"]})
+    return {"done": False, "photo_id": nxt["id"]}
 
 @app.post("/api/admin/prev-photo")
-def prev_photo(user=Depends(admin_user)):
+async def prev_photo(user=Depends(admin_user)):
     db = get_db(); cur = get_setting(db, "current_photo_id")
     if not cur: raise HTTPException(400, "No current photo")
     prev = db.execute(
@@ -430,19 +468,25 @@ def prev_photo(user=Depends(admin_user)):
     if not prev: raise HTTPException(400, "Already at first photo")
     set_setting(db, "current_photo_id", str(prev["id"]))
     set_setting(db, "voting_open", "1")
-    db.close(); return {"photo_id": prev["id"]}
+    db.close()
+    await ws_manager.broadcast({"type": "photo_change", "photo_id": prev["id"]})
+    return {"photo_id": prev["id"]}
 
 @app.post("/api/admin/set-photo/{pid}")
-def set_photo(pid: int, user=Depends(admin_user)):
+async def set_photo(pid: int, user=Depends(admin_user)):
     db = get_db()
     if not db.execute("SELECT id FROM photos WHERE id=?", (pid,)).fetchone(): raise HTTPException(404)
     set_setting(db, "current_photo_id", str(pid))
     set_setting(db, "voting_open", "1")
-    db.close(); return {"ok": True}
+    db.close()
+    await ws_manager.broadcast({"type": "photo_change", "photo_id": pid})
+    return {"ok": True}
 
 @app.post("/api/admin/close-voting")
-def close_voting(user=Depends(admin_user)):
-    db = get_db(); set_setting(db, "voting_open", "0"); db.close(); return {"ok": True}
+async def close_voting(user=Depends(admin_user)):
+    db = get_db(); set_setting(db, "voting_open", "0"); db.close()
+    await ws_manager.broadcast({"type": "voting_closed"})
+    return {"ok": True}
 
 # ── TIERLIST ──────────────────────────────────────────────────────────────────
 
