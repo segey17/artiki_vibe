@@ -120,6 +120,22 @@
           <button class="btn-secondary" onclick="exportCSV()">📄 Экспорт CSV</button>
         </div>
       </div>
+
+      <!-- TAG FILTER PANEL -->
+      <div class="tl-filter-panel">
+        <div class="tl-filter-header">
+          <span class="tl-filter-title">🏷️ Фильтр по тегам</span>
+          <span class="tl-filter-hint" id="tl-filter-hint">Выберите теги для фильтра</span>
+          <button class="tl-filter-clear" id="tl-filter-clear" onclick="clearTagFilter()" style="display:none">✕ Сбросить</button>
+        </div>
+        <div class="tl-filter-search-wrap">
+          <input class="tl-filter-search" id="tl-filter-search" placeholder="Поиск тега..." oninput="filterTagSearch(this.value)" autocomplete="off">
+        </div>
+        <div class="tl-tag-list" id="tl-tag-list">
+          <span class="tl-tags-loading">Загрузка тегов...</span>
+        </div>
+      </div>
+
       <div id="tierlist-container"></div>
       <div id="tierlist-empty" class="empty-state" style="display:none">
         <div style="font-size:3rem">⏳</div><p>Пока нет оценённых фотографий.</p>
@@ -147,6 +163,12 @@
             <button class="btn-secondary" onclick="addTier()">+ Добавить тир</button>
             <button class="btn-primary" onclick="saveTierLabels()">Сохранить</button>
           </div>
+        </div>
+
+        <div class="admin-card danger-card">
+          <h2>🗑️ Сброс базы данных</h2>
+          <p class="hint">Удалит всех пользователей (кроме администраторов), все фотографии и оценки. Действие необратимо.</p>
+          <button class="btn-danger" onclick="resetDB()">Полностью очистить БД</button>
         </div>
 
         <div class="admin-card">

@@ -490,26 +490,94 @@ async def close_voting(user=Depends(admin_user)):
 
 # ── TIERLIST ──────────────────────────────────────────────────────────────────
 
+@app.get("/api/tierlist/tags")
+def tierlist_tags(user=Depends(current_user)):
+    """Возвращает все теги, которые есть хотя бы у одного оценённого фото."""
+    db = get_db()
+    rows = db.execute("""
+        SELECT DISTINCT t.id, t.name
+        FROM tags t
+        JOIN photo_tags pt ON pt.tag_id = t.id
+        JOIN ratings r ON r.photo_id = pt.photo_id
+        ORDER BY t.name
+    """).fetchall()
+    db.close()
+    return [{"id": r["id"], "name": r["name"]} for r in rows]
+
+
 @app.get("/api/tierlist")
-def tierlist(user=Depends(current_user)):
+def tierlist(tag_ids: str = "", exclude_tag_ids: str = "", user=Depends(current_user)):
+    """
+    tag_ids — список id тегов через запятую для включения (фото должны иметь ВСЕ).
+    exclude_tag_ids — список id тегов через запятую для исключения (фото не должны иметь НИ ОДНОГО).
+    """
     db = get_db()
     tiers = get_tiers(db)
     tier_order = [t["id"] for t in tiers]
     tier_map = {t["id"]: t for t in tiers}
 
-    # assign score by position: first tier = highest
     n = len(tiers)
     tier_score = {t["id"]: n - i for i, t in enumerate(tiers)}
 
-    # get photos with ratings
-    rows = db.execute("""
+    # parse include filter
+    selected_tag_ids = []
+    if tag_ids.strip():
+        try:
+            selected_tag_ids = [int(x) for x in tag_ids.split(",") if x.strip()]
+        except ValueError:
+            pass
+
+    # parse exclude filter
+    excluded_tag_ids = []
+    if exclude_tag_ids.strip():
+        try:
+            excluded_tag_ids = [int(x) for x in exclude_tag_ids.split(",") if x.strip()]
+        except ValueError:
+            pass
+
+    # build allowed_ids from include filter
+    if selected_tag_ids:
+        placeholders = ",".join("?" * len(selected_tag_ids))
+        filtered_ids = db.execute(f"""
+            SELECT photo_id
+            FROM photo_tags
+            WHERE tag_id IN ({placeholders})
+            GROUP BY photo_id
+            HAVING COUNT(DISTINCT tag_id) = {len(selected_tag_ids)}
+        """, selected_tag_ids).fetchall()
+        allowed_ids = {r["photo_id"] for r in filtered_ids}
+    else:
+        # all rated photos
+        all_rated = db.execute("SELECT DISTINCT photo_id FROM ratings").fetchall()
+        allowed_ids = {r["photo_id"] for r in all_rated}
+
+    # apply exclude filter — remove photos that have ANY of the excluded tags
+    if excluded_tag_ids and allowed_ids:
+        excl_placeholders = ",".join("?" * len(excluded_tag_ids))
+        excl_rows = db.execute(f"""
+            SELECT DISTINCT photo_id
+            FROM photo_tags
+            WHERE tag_id IN ({excl_placeholders})
+        """, excluded_tag_ids).fetchall()
+        excl_photo_ids = {r["photo_id"] for r in excl_rows}
+        allowed_ids -= excl_photo_ids
+
+    if not allowed_ids:
+        db.close()
+        return {"tiers": {tid: [] for tid in tier_order},
+                "tier_order": tier_order, "tier_map": tier_map,
+                "active_tag_ids": selected_tag_ids,
+                "excluded_tag_ids": excluded_tag_ids}
+
+    id_placeholders = ",".join("?" * len(allowed_ids))
+    rows = db.execute(f"""
         SELECT p.id, p.filename, p.original_name,
                r.tier_id, COUNT(*) as cnt
         FROM ratings r JOIN photos p ON p.id=r.photo_id
+        WHERE p.id IN ({id_placeholders})
         GROUP BY p.id, r.tier_id
-    """).fetchall()
+    """, list(allowed_ids)).fetchall()
 
-    # accumulate weighted score per photo
     from collections import defaultdict
     photo_info = {}
     photo_scores = defaultdict(list)
@@ -519,11 +587,9 @@ def tierlist(user=Depends(current_user)):
         for _ in range(row["cnt"]):
             photo_scores[pid].append(tier_score.get(row["tier_id"], 1))
 
-    # compute avg and assign tier
     result = {tid: [] for tid in tier_order}
     for pid, scores in photo_scores.items():
         avg = sum(scores) / len(scores)
-        # map avg score back to tier index
         idx = round(n - avg)
         idx = max(0, min(n-1, idx))
         assigned_tier = tier_order[idx]
@@ -534,12 +600,13 @@ def tierlist(user=Depends(current_user)):
             "tier_id": assigned_tier,
         })
 
-    # sort each tier by avg desc
     for tid in result:
         result[tid].sort(key=lambda x: -x["avg_score"])
 
     db.close()
-    return {"tiers": result, "tier_order": tier_order, "tier_map": tier_map}
+    return {"tiers": result, "tier_order": tier_order, "tier_map": tier_map,
+            "active_tag_ids": selected_tag_ids,
+            "excluded_tag_ids": excluded_tag_ids}
 
 
 @app.get("/api/photo-detail/{photo_id}")
@@ -585,6 +652,25 @@ def stats(user=Depends(admin_user)):
         "total_votes": db.execute("SELECT COUNT(*) FROM ratings").fetchone()[0],
     }
     db.close(); return r
+
+@app.post("/api/admin/reset-db")
+def reset_db(user=Depends(admin_user)):
+    db = get_db()
+    # delete all non-admin users
+    db.execute("DELETE FROM users WHERE is_admin=0")
+    # delete all photos from disk
+    photos = db.execute("SELECT filename FROM photos").fetchall()
+    for p in photos:
+        try: os.remove(os.path.join(PHOTOS_DIR, p["filename"]))
+        except: pass
+    db.execute("DELETE FROM photos")
+    db.execute("DELETE FROM ratings")
+    db.execute("DELETE FROM photo_tags")
+    db.execute("UPDATE settings SET value=NULL WHERE key='current_photo_id'")
+    db.execute("UPDATE settings SET value='1' WHERE key='voting_open'")
+    db.commit()
+    db.close()
+    return {"ok": True}
 
 @app.get("/api/admin/users")
 def list_users(user=Depends(admin_user)):

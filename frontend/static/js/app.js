@@ -31,7 +31,6 @@ function showVote() {
   loadCurrentPhoto(); startPolling();
 }
 function showAdmin() { clearPolling(); showScreen('admin'); loadPhotos(); loadAdminStats(); renderTierEditor(); }
-function showTierlist() { clearPolling(); showScreen('tierlist'); loadTierlist(); }
 
 // ── AUTH ─────────────────────────────────────────────────────────────────────
 function switchTab(tab) {
@@ -315,6 +314,17 @@ async function deletePhoto(id) {
   catch(e) { toast(e.message,'err'); }
 }
 
+async function resetDB() {
+  if (!confirm('Вы уверены? Это удалит всех пользователей (кроме администраторов), все фотографии и оценки. Действие необратимо!')) return;
+  if (!confirm('Последнее предупреждение: восстановить данные будет невозможно. Продолжить?')) return;
+  try {
+    await req('POST', '/api/admin/reset-db');
+    toast('База данных очищена', 'ok');
+    loadPhotos();
+    loadAdminStats();
+  } catch(e) { toast(e.message || 'Ошибка', 'err'); }
+}
+
 async function uploadFiles(files) {
   if (!files.length) return;
   const BATCH=20; let done=0, total=files.length;
@@ -340,6 +350,10 @@ function setUpProgress(p,l){document.getElementById('up-fill').style.width=p+'%'
 // ── TIERLIST ──────────────────────────────────────────────────────────────────
 // Cache tierlist data for export
 let tierlistData = null;
+let allTierlistTags = [];      // [{id, name}] — все теги оценённых фото
+let activeTierTagIds = new Set(); // выбранные id тегов для фильтра (включить)
+let excludedTierTagIds = new Set(); // исключённые id тегов
+let filteredTagSearch = '';    // поисковый запрос в панели тегов
 
 function textColorFor(hex) {
   const h = hex.replace('#','');
@@ -347,9 +361,89 @@ function textColorFor(hex) {
   return (0.299*r+0.587*g+0.114*b)/255 > 0.55 ? '#1a1a1a' : '#ffffff';
 }
 
+async function loadTierlistTags() {
+  try {
+    const tags = await req('GET', '/api/tierlist/tags');
+    allTierlistTags = tags;
+    renderTierlistTagPanel();
+  } catch(e) {
+    document.getElementById('tl-tag-list').innerHTML = '<span class="tl-tags-loading">Теги недоступны</span>';
+  }
+}
+
+function renderTierlistTagPanel() {
+  const list = document.getElementById('tl-tag-list');
+  const clearBtn = document.getElementById('tl-filter-clear');
+  const hint = document.getElementById('tl-filter-hint');
+
+  const query = filteredTagSearch.toLowerCase();
+  const visible = allTierlistTags.filter(t =>
+    !query || t.name.toLowerCase().includes(query)
+  );
+
+  if (!allTierlistTags.length) {
+    list.innerHTML = '<span class="tl-tags-loading">Нет тегов</span>';
+    clearBtn.style.display = 'none';
+    hint.textContent = '';
+    return;
+  }
+
+  const hasFilter = activeTierTagIds.size || excludedTierTagIds.size;
+  clearBtn.style.display = hasFilter ? '' : 'none';
+
+  const parts = [];
+  if (activeTierTagIds.size) parts.push(`✅ включено: ${activeTierTagIds.size}`);
+  if (excludedTierTagIds.size) parts.push(`🚫 исключено: ${excludedTierTagIds.size}`);
+  hint.textContent = parts.length ? parts.join(' · ') : 'Клик — включить, ещё раз — исключить';
+
+  list.innerHTML = visible.map(t => {
+    const included = activeTierTagIds.has(t.id);
+    const excluded = excludedTierTagIds.has(t.id);
+    const cls = included ? 'active' : excluded ? 'excluded' : '';
+    const prefix = included ? '✅ ' : excluded ? '🚫 ' : '';
+    return `<button class="tl-tag-chip ${cls}"
+      onclick="toggleTierTag(${t.id})" title="${excluded ? 'Исключить' : included ? 'Снять' : 'Включить'}">${prefix}${t.name}</button>`;
+  }).join('') || '<span class="tl-tags-loading">Ничего не найдено</span>';
+}
+
+function filterTagSearch(val) {
+  filteredTagSearch = val;
+  renderTierlistTagPanel();
+}
+
+function toggleTierTag(id) {
+  if (activeTierTagIds.has(id)) {
+    // включён → исключить
+    activeTierTagIds.delete(id);
+    excludedTierTagIds.add(id);
+  } else if (excludedTierTagIds.has(id)) {
+    // исключён → нейтральный
+    excludedTierTagIds.delete(id);
+  } else {
+    // нейтральный → включить
+    activeTierTagIds.add(id);
+  }
+  renderTierlistTagPanel();
+  loadTierlist();
+}
+
+function clearTagFilter() {
+  activeTierTagIds.clear();
+  excludedTierTagIds.clear();
+  renderTierlistTagPanel();
+  loadTierlist();
+}
+
 async function loadTierlist() {
   try {
-    const data = await req('GET','/api/tierlist');
+    const tagParam = [...activeTierTagIds].join(',');
+    const excludeParam = [...excludedTierTagIds].join(',');
+    let url = '/api/tierlist';
+    const params = [];
+    if (tagParam) params.push(`tag_ids=${tagParam}`);
+    if (excludeParam) params.push(`exclude_tag_ids=${excludeParam}`);
+    if (params.length) url += '?' + params.join('&');
+    const data = await req('GET', url);
     tierlistData = data;
     const tierMap = data.tier_map || {};
     const container = document.getElementById('tierlist-container');
@@ -373,27 +467,69 @@ async function loadTierlist() {
         </div>
       </div>`;
     }).join('');
-    document.getElementById('tierlist-empty').style.display = hasAny ? 'none' : '';
+
+    const emptyEl = document.getElementById('tierlist-empty');
+    if (!hasAny) {
+      emptyEl.style.display = '';
+      emptyEl.innerHTML = (activeTierTagIds.size || excludedTierTagIds.size)
+        ? `<div style="font-size:3rem">🔍</div><p>Нет фото с выбранными тегами.</p>`
+        : `<div style="font-size:3rem">⏳</div><p>Пока нет оценённых фотографий.</p>`;
+    } else {
+      emptyEl.style.display = 'none';
+    }
   } catch(e) { toast(e.message,'err'); }
 }
 
-// ── PHOTO MODAL ───────────────────────────────────────────────────────────────
+function showTierlist() {
+  clearPolling();
+  showScreen('tierlist');
+  activeTierTagIds.clear();
+  excludedTierTagIds.clear();
+  filteredTagSearch = '';
+  const searchInput = document.getElementById('tl-filter-search');
+  if (searchInput) searchInput.value = '';
+  loadTierlistTags();
+  loadTierlist();
+}
+
 // ── EXPORT ────────────────────────────────────────────────────────────────────
+
+function getExportFilename(ext) {
+  const hasFilt = activeTierTagIds.size || excludedTierTagIds.size;
+  if (!hasFilt) return `tierlist.${ext}`;
+  const inclNames = [...activeTierTagIds]
+    .map(id => allTierlistTags.find(t => t.id === id)?.name || id).join('_');
+  const exclNames = [...excludedTierTagIds]
+    .map(id => allTierlistTags.find(t => t.id === id)?.name || id).map(n => 'no-'+n).join('_');
+  const combined = [inclNames, exclNames].filter(Boolean).join('_')
+    .replace(/[^a-zа-яёА-ЯЁA-Z0-9_-]/gi, '').slice(0, 40);
+  return `tierlist_${combined}.${ext}`;
+}
+
 async function exportCSV() {
   if (!tierlistData) { toast('Сначала загрузите тир-лист','err'); return; }
   const tierMap = tierlistData.tier_map || {};
-  let csv = 'Тир,Название файла,Голосов\n';
+  const inclNote = activeTierTagIds.size
+    ? 'Включены: ' + [...activeTierTagIds].map(id => allTierlistTags.find(t=>t.id===id)?.name || id).join(', ')
+    : '';
+  const exclNote = excludedTierTagIds.size
+    ? 'Исключены: ' + [...excludedTierTagIds].map(id => allTierlistTags.find(t=>t.id===id)?.name || id).join(', ')
+    : '';
+  const tagNote = [inclNote, exclNote].filter(Boolean).join(' | ');
+  let csv = tagNote ? `# Фильтр: ${tagNote}\n` : '';
+  csv += 'Тир,Название файла,Голосов\n';
   tierlistData.tier_order.forEach(tid => {
     const label = tierMap[tid]?.label || tid;
     (tierlistData.tiers[tid] || []).forEach(p => {
       csv += `"${label}","${(p.original_name||p.filename).replace(/"/g,'""')}","${p.vote_count}"\n`;
     });
   });
-  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const blob = new Blob(['\uFEFF' + csv], {type:'text/csv;charset=utf-8;'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'tierlist.csv';
+  a.download = getExportFilename('csv');
   a.click();
+  toast('CSV сохранён!', 'ok');
 }
 
 async function exportPNG() {
@@ -403,13 +539,13 @@ async function exportPNG() {
   const tierMap = tierlistData.tier_map || {};
   const THUMB = 80, PAD = 8, LABEL_W = 100, GAP = 4;
 
-  // calc rows
   const rows = tierlistData.tier_order.map(tid => ({
     tid, info: tierMap[tid]||{label:tid,color:'#888'},
     photos: tierlistData.tiers[tid]||[]
   })).filter(r => r.photos.length > 0);
 
-  // load all images
+  if (!rows.length) { toast('Нет данных для экспорта','err'); return; }
+
   const loadImg = src => new Promise(res => {
     const img = new Image(); img.crossOrigin='anonymous';
     img.onload = () => res(img);
@@ -422,51 +558,57 @@ async function exportPNG() {
     allImgs[p.filename] = await loadImg(`/photos/${p.filename}`);
   })));
 
-  // canvas size
+  const inclLabel = activeTierTagIds.size
+    ? 'Включены: ' + [...activeTierTagIds].map(id => allTierlistTags.find(t=>t.id===id)?.name || '').join(', ')
+    : '';
+  const exclLabel = excludedTierTagIds.size
+    ? 'Исключены: ' + [...excludedTierTagIds].map(id => allTierlistTags.find(t=>t.id===id)?.name || '').join(', ')
+    : '';
+  const tagLabel = [inclLabel, exclLabel].filter(Boolean).join('  |  ');
+
   const maxPhotosPerRow = Math.max(...rows.map(r=>r.photos.length));
   const rowH = THUMB + PAD*2;
   const canvasW = LABEL_W + Math.min(maxPhotosPerRow, 12) * (THUMB+GAP) + PAD*2 + 40;
-  const canvasH = rows.length * (rowH + GAP) + 60;
+  const titleLines = tagLabel ? 2 : 1;
+  const canvasH = rows.length * (rowH + GAP) + 52 + titleLines * 24;
 
   const canvas = document.createElement('canvas');
   canvas.width = canvasW; canvas.height = canvasH;
   const ctx = canvas.getContext('2d');
 
-  // background
   ctx.fillStyle = '#0a0a0b';
   ctx.fillRect(0, 0, canvasW, canvasH);
 
-  // title
   ctx.fillStyle = '#f0f0f0';
   ctx.font = 'bold 20px sans-serif';
-  ctx.fillText('Тир-лист результатов', PAD, 36);
+  ctx.fillText('Тир-лист результатов', PAD, 30);
+  if (tagLabel) {
+    ctx.fillStyle = '#e8c84a';
+    ctx.font = '13px sans-serif';
+    ctx.fillText(tagLabel, PAD, 50);
+  }
 
-  let y = 52;
+  let y = 52 + (titleLines - 1) * 22;
   for (const row of rows) {
     const tc = textColorFor(row.info.color);
-    // tier label bg
     ctx.fillStyle = row.info.color;
     ctx.beginPath();
     ctx.roundRect(PAD, y, LABEL_W - PAD, rowH, 8);
     ctx.fill();
-    // tier label text
     ctx.fillStyle = tc;
     ctx.font = 'bold 14px sans-serif';
     ctx.textAlign = 'center';
     ctx.fillText(row.info.label, PAD + (LABEL_W-PAD)/2, y + rowH/2 + 5);
     ctx.textAlign = 'left';
 
-    // photos
     let x = LABEL_W + PAD;
     for (const p of row.photos.slice(0, 12)) {
       const img = allImgs[p.filename];
       if (img) {
-        // clip to rounded rect
         ctx.save();
         ctx.beginPath();
         ctx.roundRect(x, y+PAD, THUMB, THUMB, 6);
         ctx.clip();
-        // cover fit
         const scale = Math.max(THUMB/img.width, THUMB/img.height);
         const sw = img.width*scale, sh = img.height*scale;
         ctx.drawImage(img, x+(THUMB-sw)/2, y+PAD+(THUMB-sh)/2, sw, sh);
@@ -480,7 +622,7 @@ async function exportPNG() {
   canvas.toBlob(blob => {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'tierlist.png';
+    a.download = getExportFilename('png');
     a.click();
     toast('PNG сохранён!', 'ok');
   }, 'image/png');
@@ -591,57 +733,7 @@ function closeModal(e) {
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePhotoModal(); });
 
-// ── EXPORT ────────────────────────────────────────────────────────────────────
 
-async function exportPNG() {
-  toast('Генерация PNG...', '');
-  // Use html2canvas via CDN loaded dynamically
-  if (!window.html2canvas) {
-    await new Promise((res, rej) => {
-      const s = document.createElement('script');
-      s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
-      s.onload = res; s.onerror = rej;
-      document.head.appendChild(s);
-    });
-  }
-  const el = document.getElementById('tierlist-container');
-  try {
-    const canvas = await html2canvas(el, {
-      backgroundColor: '#0a0a0b',
-      scale: 2,
-      useCORS: true,
-      allowTaint: true,
-    });
-    const link = document.createElement('a');
-    link.download = 'tierlist.png';
-    link.href = canvas.toDataURL('image/png');
-    link.click();
-    toast('PNG сохранён!', 'ok');
-  } catch(e) {
-    toast('Ошибка: ' + e.message, 'err');
-  }
-}
-
-async function exportCSV() {
-  try {
-    const data = await req('GET', '/api/tierlist');
-    const tierMap = data.tier_map || {};
-    const rows = [['Тир', 'Файл', 'Голосов']];
-    for (const tid of data.tier_order) {
-      const label = tierMap[tid]?.label || tid;
-      for (const p of (data.tiers[tid] || [])) {
-        rows.push([label, p.original_name || p.filename, p.vote_count]);
-      }
-    }
-    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
-    const blob = new Blob(['\uFEFF' + csv], {type: 'text/csv;charset=utf-8'});
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = 'tierlist.csv';
-    link.click();
-    toast('CSV сохранён!', 'ok');
-  } catch(e) { toast(e.message, 'err'); }
-}
 
 // ── TAGS ──────────────────────────────────────────────────────────────────────
 let myTags = [];        // tag objects {id, name} set by current user
