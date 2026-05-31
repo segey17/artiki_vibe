@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PhotoRank</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;700;900&family=Manrope:wght@300;400;500;600&display=swap">
 <link rel="stylesheet" href="/static/css/style.css">
 </head>
@@ -46,49 +45,40 @@
         <button class="nav-btn" onclick="logout()" title="Выйти">⏻</button>
       </nav>
     </header>
-
     <main class="vote-main">
       <div id="no-photo" class="empty-state" style="display:none">
         <div style="font-size:3rem">🖼️</div>
         <p>Фото ещё не выбрано.</p>
         <p class="sub">Администратор запустит голосование.</p>
       </div>
-
       <div id="vote-content">
         <div class="photo-frame">
-          <img id="current-photo-img" src="" alt="Фото дня">
-          <div class="photo-overlay">
-            <div class="photo-counter" id="photo-counter"></div>
-          </div>
+          <img id="current-photo-img" src="" alt="">
         </div>
-
         <div class="vote-panel">
           <div class="photo-name" id="photo-name"></div>
-
           <div class="vote-progress">
             <div class="progress-label">
-              <span>Проголосовали</span>
-              <span id="progress-fraction">0 / 0</span>
+              <span>Проголосовали</span><span id="progress-fraction">0/0</span>
             </div>
             <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
           </div>
-
           <div id="vote-stars-section">
             <div class="stars-label">Ваша оценка</div>
             <div class="tier-vote-btns" id="tier-vote-btns"></div>
             <button class="btn-vote" id="btn-vote" disabled onclick="submitVote()">Выберите оценку</button>
           </div>
+          <div id="vote-closed-msg" class="closed-msg" style="display:none">🔒 Голосование закрыто</div>
+          <div id="voted-badge" class="voted-badge" style="display:none">✅ <span id="voted-text"></span></div>
 
-          <div id="vote-closed-msg" class="closed-msg" style="display:none">
-            🔒 Голосование закрыто
-          </div>
-
-          <div id="voted-badge" class="voted-badge" style="display:none">
-            ✅ <span id="voted-text"></span>
+          <div class="votes-list-wrap">
+            <button class="votes-toggle" onclick="toggleVotesList()" id="votes-toggle">
+              <span id="votes-toggle-label">Показать голоса ▾</span>
+            </button>
+            <div class="votes-list" id="votes-list" style="display:none"></div>
           </div>
         </div>
       </div>
-
       <div id="admin-controls" class="admin-bar" style="display:none">
         <div class="admin-bar-title">⚙️ Управление</div>
         <div class="admin-bar-btns">
@@ -112,11 +102,10 @@
     </header>
     <main class="tierlist-main">
       <h1 class="tierlist-title">Тир-лист <span>результатов</span></h1>
-      <p class="tierlist-sub">Средняя оценка всех пользователей</p>
+      <p class="tierlist-sub">По средней оценке всех пользователей</p>
       <div id="tierlist-container"></div>
-      <div id="tierlist-empty" style="display:none" class="empty-state">
-        <div style="font-size:3rem">⏳</div>
-        <p>Пока нет оценённых фотографий.</p>
+      <div id="tierlist-empty" class="empty-state" style="display:none">
+        <div style="font-size:3rem">⏳</div><p>Пока нет оценённых фотографий.</p>
       </div>
     </main>
   </div>
@@ -133,18 +122,19 @@
       <h1>Панель администратора</h1>
       <div class="admin-cards">
 
-        <!-- Тир редактор -->
         <div class="admin-card">
-          <h2>🏷️ Названия тиров</h2>
-          <p class="hint">Задайте своё название для каждого тира. Пользователи будут видеть их при голосовании.</p>
+          <h2>🏷️ Настройка тиров</h2>
+          <p class="hint">Добавляйте, удаляйте и переименовывайте тиры. Порядок сверху вниз — от лучшего к худшему.</p>
           <div id="tier-editor"></div>
-          <button class="btn-primary mt" onclick="saveTierLabels()">Сохранить названия</button>
+          <div class="tier-editor-actions">
+            <button class="btn-secondary" onclick="addTier()">+ Добавить тир</button>
+            <button class="btn-primary" onclick="saveTierLabels()">Сохранить</button>
+          </div>
         </div>
 
-        <!-- Загрузка -->
         <div class="admin-card">
           <h2>📤 Загрузить фотографии</h2>
-          <p class="hint">jpg/png/webp/avif/heic. Пакетная загрузка.</p>
+          <p class="hint">jpg / png / webp / avif / heic. Пакетная загрузка.</p>
           <div class="upload-zone" onclick="document.getElementById('file-input').click()"
                ondragover="event.preventDefault()" ondrop="handleDrop(event)">
             <div style="font-size:2rem">☁️</div>
@@ -153,23 +143,21 @@
           <input type="file" id="file-input" multiple accept="image/*" style="display:none" onchange="uploadFiles(this.files)">
           <div class="upload-progress" id="upload-progress" style="display:none">
             <div class="up-bar"><div class="up-fill" id="up-fill"></div></div>
-            <div class="up-label" id="up-label">Загрузка...</div>
+            <div class="up-label" id="up-label"></div>
           </div>
         </div>
 
-        <!-- Статистика -->
         <div class="admin-card">
           <h2>📊 Статистика</h2>
           <div id="admin-stats-card" class="stats-grid"></div>
           <button class="btn-secondary mt" onclick="loadAdminStats()">↻ Обновить</button>
         </div>
 
-        <!-- Список фото -->
         <div class="admin-card full">
           <h2>🖼️ Фотографии <span id="photo-count-label"></span></h2>
           <div class="table-wrap">
-            <table id="photos-table">
-              <thead><tr><th>#</th><th>Превью</th><th>Файл</th><th>Голосов</th><th>Средняя</th><th></th></tr></thead>
+            <table>
+              <thead><tr><th>#</th><th>Превью</th><th>Файл</th><th>Голосов</th><th></th></tr></thead>
               <tbody id="photos-tbody"></tbody>
             </table>
           </div>
@@ -179,8 +167,8 @@
       </div>
     </main>
   </div>
-
 </div>
+
 <div id="toast" class="toast"></div>
 <script src="/static/js/app.js"></script>
 </body>
