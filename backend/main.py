@@ -3,7 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import sqlite3, os, jwt, bcrypt, uuid, io, json, asyncio
+from contextlib import asynccontextmanager
+import sqlite3, os, jwt, bcrypt, uuid, io, json, asyncio, httpx, re
 from datetime import datetime, timedelta
 from typing import Optional
 from PIL import Image as PILImage
@@ -14,7 +15,17 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="PhotoRank")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(yadisk_sync_loop())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+app = FastAPI(title="PhotoRank", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -22,14 +33,19 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 
 class WSManager:
     def __init__(self):
-        self.connections: list[WebSocket] = []
+        # ws -> user_id (None for unauthenticated)
+        self.connections: dict[WebSocket, Optional[int]] = {}
 
-    async def connect(self, ws: WebSocket):
+    async def connect(self, ws: WebSocket, user_id: Optional[int] = None):
         await ws.accept()
-        self.connections.append(ws)
+        self.connections[ws] = user_id
 
     def disconnect(self, ws: WebSocket):
-        self.connections.remove(ws) if ws in self.connections else None
+        self.connections.pop(ws, None)
+
+    def online_user_ids(self) -> set[int]:
+        """Возвращает множество user_id пользователей онлайн (без None)."""
+        return {uid for uid in self.connections.values() if uid is not None}
 
     async def broadcast(self, data: dict):
         msg = json.dumps(data, ensure_ascii=False)
@@ -45,11 +61,18 @@ class WSManager:
 ws_manager = WSManager()
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws_manager.connect(ws)
+async def websocket_endpoint(ws: WebSocket, token: Optional[str] = None):
+    user_id = None
+    if token:
+        try:
+            d = jwt.decode(token, SECRET, algorithms=["HS256"])
+            user_id = int(d["sub"])
+        except Exception:
+            pass
+    await ws_manager.connect(ws, user_id)
     try:
         while True:
-            await ws.receive_text()  # keep alive, ignore messages
+            await ws.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(ws)
 
@@ -107,6 +130,7 @@ def init_db():
     INSERT OR IGNORE INTO settings VALUES ('current_photo_id', NULL);
     INSERT OR IGNORE INTO settings VALUES ('voting_open', '1');
     INSERT OR IGNORE INTO settings VALUES ('tiers', NULL);
+    INSERT OR IGNORE INTO settings VALUES ('auto_advance', '0');
     CREATE TABLE IF NOT EXISTS tags (
         id INTEGER PRIMARY KEY,
         name TEXT UNIQUE NOT NULL,
@@ -122,6 +146,15 @@ def init_db():
         UNIQUE(photo_id, user_id, tag_id)
     );
     CREATE INDEX IF NOT EXISTS idx_photo_tags_photo ON photo_tags(photo_id);
+    CREATE TABLE IF NOT EXISTS yadisk_watch (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        public_url TEXT NOT NULL,
+        interval_minutes INTEGER DEFAULT 60,
+        last_sync_at TEXT,
+        last_sync_added INTEGER DEFAULT 0,
+        last_sync_errors INTEGER DEFAULT 0,
+        enabled INTEGER DEFAULT 1
+    );
     """)
     cols = [r[1] for r in db.execute("PRAGMA table_info(ratings)").fetchall()]
     if 'score' in cols and 'tier_id' not in cols:
@@ -239,6 +272,260 @@ def api_set_tiers(body: dict, user=Depends(admin_user)):
     db.close()
     return tiers
 
+
+# ── YANDEX DISK IMPORT ───────────────────────────────────────────────────────
+
+YADISK_API = "https://cloud-api.yandex.net/v1/disk/public/resources"
+
+def yadisk_public_key(url: str) -> str:
+    return url.strip()
+
+async def yadisk_list_files(public_url: str, path: str = "/") -> list:
+    """Рекурсивно получает все файлы из публичной папки."""
+    params = {
+        "public_key": public_url,
+        "path": path,
+        "limit": 100,
+        "offset": 0,
+    }
+    files = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            r = await client.get(YADISK_API, params=params)
+            if r.status_code != 200:
+                raise HTTPException(502, f"Яндекс.Диск API вернул {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            items = data.get("_embedded", {}).get("items", [])
+            for item in items:
+                if item["type"] == "file" and item.get("mime_type", "").startswith("image/"):
+                    files.append({
+                        "name": item["name"],
+                        "path": item["path"],
+                        "size": item.get("size", 0),
+                    })
+                elif item["type"] == "dir":
+                    sub = await yadisk_list_files(public_url, item["path"])
+                    files.extend(sub)
+            total = data.get("_embedded", {}).get("total", 0)
+            params["offset"] += len(items)
+            if params["offset"] >= total or not items:
+                break
+    return files
+
+async def yadisk_download_file(public_url: str, path: str) -> bytes:
+    """Получает прямую ссылку и скачивает файл."""
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(
+            "https://cloud-api.yandex.net/v1/disk/public/resources/download",
+            params={"public_key": public_url, "path": path}
+        )
+        if r.status_code != 200:
+            raise Exception(f"Не удалось получить ссылку: {r.status_code}")
+        download_url = r.json()["href"]
+        resp = await client.get(download_url, follow_redirects=True)
+        resp.raise_for_status()
+        return resp.content
+
+
+@app.post("/api/admin/import-yadisk")
+async def import_yadisk(public_url: str = Form(...), user=Depends(admin_user)):
+    """
+    Сканирует публичную папку Яндекс.Диска и импортирует все изображения.
+    Уже существующие файлы (по имени) пропускаются.
+    """
+    db = get_db()
+    existing_names = {r["original_name"] for r in
+                      db.execute("SELECT original_name FROM photos").fetchall()}
+
+    # get list of files
+    try:
+        all_files = await yadisk_list_files(public_url)
+    except HTTPException:
+        db.close()
+        raise
+    except Exception as e:
+        db.close()
+        raise HTTPException(502, f"Ошибка получения списка файлов: {e}")
+
+    new_files = [f for f in all_files if f["name"] not in existing_names]
+
+    added = 0
+    errors = 0
+    for file_info in new_files:
+        try:
+            data = await yadisk_download_file(public_url, file_info["path"])
+            img = PILImage.open(io.BytesIO(data))
+            img.load()
+            uid = str(uuid.uuid4())
+            filename = uid + ".jpg"
+            path = os.path.join(PHOTOS_DIR, filename)
+            img.convert("RGB").save(path, "JPEG", quality=92)
+            count = db.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+            db.execute(
+                "INSERT INTO photos (filename, original_name, position) VALUES (?,?,?)",
+                (filename, file_info["name"], count)
+            )
+            db.commit()
+            added += 1
+        except Exception:
+            errors += 1
+            continue
+
+    db.close()
+    return {
+        "total_found": len(all_files),
+        "skipped": len(all_files) - len(new_files),
+        "added": added,
+        "errors": errors,
+    }
+
+
+@app.get("/api/admin/preview-yadisk")
+async def preview_yadisk(public_url: str, user=Depends(admin_user)):
+    """Возвращает список файлов в папке без скачивания."""
+    try:
+        files = await yadisk_list_files(public_url)
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+    db = get_db()
+    existing = {r["original_name"] for r in
+                db.execute("SELECT original_name FROM photos").fetchall()}
+    db.close()
+
+    return {
+        "total": len(files),
+        "new": len([f for f in files if f["name"] not in existing]),
+        "files": [{"name": f["name"], "size": f["size"],
+                   "exists": f["name"] in existing} for f in files[:50]],
+    }
+
+# ── YANDEX DISK AUTO-SYNC ─────────────────────────────────────────────────────
+
+async def yadisk_sync_once() -> dict:
+    """Синхронизирует фото из сохранённой ссылки. Возвращает статистику."""
+    db = get_db()
+    row = db.execute("SELECT public_url FROM yadisk_watch WHERE id=1 AND enabled=1").fetchone()
+    if not row:
+        db.close()
+        return {"added": 0, "errors": 0, "skipped": 0}
+    public_url = row["public_url"]
+    existing_names = {r["original_name"] for r in
+                      db.execute("SELECT original_name FROM photos").fetchall()}
+    db.close()
+
+    try:
+        all_files = await yadisk_list_files(public_url)
+    except Exception as e:
+        db = get_db()
+        db.execute(
+            "UPDATE yadisk_watch SET last_sync_at=?, last_sync_added=0, last_sync_errors=-1 WHERE id=1",
+            (datetime.utcnow().isoformat(),)
+        )
+        db.commit(); db.close()
+        return {"added": 0, "errors": -1, "error_msg": str(e)}
+
+    new_files = [f for f in all_files if f["name"] not in existing_names]
+    added = errors = 0
+    for file_info in new_files:
+        try:
+            data = await yadisk_download_file(public_url, file_info["path"])
+            img = PILImage.open(io.BytesIO(data)); img.load()
+            uid = str(uuid.uuid4()); filename = uid + ".jpg"
+            path = os.path.join(PHOTOS_DIR, filename)
+            img.convert("RGB").save(path, "JPEG", quality=92)
+            db = get_db()
+            count = db.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+            db.execute("INSERT INTO photos (filename, original_name, position) VALUES (?,?,?)",
+                       (filename, file_info["name"], count))
+            db.commit(); db.close()
+            added += 1
+        except Exception:
+            errors += 1
+
+    db = get_db()
+    db.execute(
+        "UPDATE yadisk_watch SET last_sync_at=?, last_sync_added=?, last_sync_errors=? WHERE id=1",
+        (datetime.utcnow().isoformat(), added, errors)
+    )
+    db.commit(); db.close()
+
+    if added > 0:
+        await ws_manager.broadcast({"type": "photos_updated", "added": added})
+
+    return {"added": added, "errors": errors, "skipped": len(all_files) - len(new_files)}
+
+
+async def yadisk_sync_loop():
+    """Фоновая задача: проверяет Яндекс.Диск с заданным интервалом."""
+    while True:
+        try:
+            db = get_db()
+            row = db.execute(
+                "SELECT interval_minutes, last_sync_at FROM yadisk_watch WHERE id=1 AND enabled=1"
+            ).fetchone()
+            db.close()
+            if row:
+                interval = (row["interval_minutes"] or 60) * 60
+                last = row["last_sync_at"]
+                if last:
+                    elapsed = (datetime.utcnow() - datetime.fromisoformat(last)).total_seconds()
+                    wait = max(0, interval - elapsed)
+                else:
+                    wait = 0
+                if wait > 0:
+                    await asyncio.sleep(min(wait, 60))
+                    continue
+                await yadisk_sync_once()
+            else:
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(60)
+
+
+@app.get("/api/admin/yadisk-watch")
+def get_yadisk_watch(user=Depends(admin_user)):
+    db = get_db()
+    row = db.execute("SELECT * FROM yadisk_watch WHERE id=1").fetchone()
+    db.close()
+    return dict(row) if row else None
+
+
+@app.post("/api/admin/yadisk-watch")
+async def set_yadisk_watch(
+    public_url: str = Form(...),
+    interval_minutes: int = Form(60),
+    user=Depends(admin_user)
+):
+    db = get_db()
+    db.execute(
+        "INSERT INTO yadisk_watch (id, public_url, interval_minutes, enabled) VALUES (1,?,?,1) "
+        "ON CONFLICT(id) DO UPDATE SET public_url=excluded.public_url, "
+        "interval_minutes=excluded.interval_minutes, enabled=1, last_sync_at=NULL",
+        (public_url.strip(), max(5, interval_minutes))
+    )
+    db.commit(); db.close()
+    # Запустить немедленную синхронизацию в фоне
+    asyncio.create_task(yadisk_sync_once())
+    return {"status": "ok"}
+
+
+@app.delete("/api/admin/yadisk-watch")
+def delete_yadisk_watch(user=Depends(admin_user)):
+    db = get_db()
+    db.execute("DELETE FROM yadisk_watch WHERE id=1")
+    db.commit(); db.close()
+    return {"status": "ok"}
+
+
+@app.post("/api/admin/yadisk-watch/sync-now")
+async def yadisk_watch_sync_now(user=Depends(admin_user)):
+    result = await yadisk_sync_once()
+    return result
+
+
 # ── PHOTOS ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/admin/photos/upload")
@@ -304,6 +591,7 @@ def current_photo(user=Depends(current_user)):
     for r in db.execute("SELECT tier_id, COUNT(*) as cnt FROM ratings WHERE photo_id=? GROUP BY tier_id", (photo_id,)).fetchall():
         tier_counts[r["tier_id"]] = r["cnt"]
     total_users = db.execute("SELECT COUNT(*) FROM users WHERE is_admin=0").fetchone()[0]
+    auto_advance = get_setting(db, "auto_advance") == "1"
     db.close()
     return {
         "photo": dict(row) if row else None,
@@ -312,6 +600,7 @@ def current_photo(user=Depends(current_user)):
         "total_users": total_users,
         "tiers": tiers,
         "tier_counts": tier_counts,
+        "auto_advance": auto_advance,
     }
 
 @app.post("/api/rate")
@@ -329,7 +618,47 @@ async def rate_photo(photo_id: int = Form(...), tier_id: str = Form(...), user=D
         INSERT INTO ratings (photo_id, user_id, tier_id) VALUES (?,?,?)
         ON CONFLICT(photo_id, user_id) DO UPDATE SET tier_id=excluded.tier_id
     """, (photo_id, user["id"], tier_id))
-    db.commit(); db.close()
+    db.commit()
+
+    # ── AUTO-ADVANCE CHECK ────────────────────────────────────────────────────
+    auto_advance = get_setting(db, "auto_advance") == "1"
+    if auto_advance:
+        online_ids = ws_manager.online_user_ids()
+        # Только не-админы считаются «участниками»
+        non_admin_online = set(
+            r["id"] for r in db.execute(
+                "SELECT id FROM users WHERE is_admin=0 AND id IN ({})".format(
+                    ",".join("?" * len(online_ids)) if online_ids else "NULL"
+                ), tuple(online_ids)
+            ).fetchall()
+        ) if online_ids else set()
+
+        if non_admin_online:
+            voted_ids = set(
+                r["user_id"] for r in db.execute(
+                    "SELECT user_id FROM ratings WHERE photo_id=?", (photo_id,)
+                ).fetchall()
+            )
+            all_voted = non_admin_online.issubset(voted_ids)
+            if all_voted:
+                # Переходим к следующему фото
+                nxt = db.execute(
+                    "SELECT id FROM photos WHERE position>(SELECT position FROM photos WHERE id=?) ORDER BY position LIMIT 1",
+                    (photo_id,)
+                ).fetchone()
+                if nxt:
+                    set_setting(db, "current_photo_id", str(nxt["id"]))
+                    set_setting(db, "voting_open", "1")
+                    db.close()
+                    await ws_manager.broadcast({"type": "photo_change", "photo_id": nxt["id"], "auto": True})
+                    return {"ok": True, "auto_advanced": True}
+                else:
+                    # Все фото просмотрены
+                    db.close()
+                    await ws_manager.broadcast({"type": "all_done"})
+                    return {"ok": True, "auto_advanced": True}
+
+    db.close()
     await ws_manager.broadcast({"type": "vote_update", "photo_id": photo_id})
     return {"ok": True}
 
@@ -482,11 +811,62 @@ async def set_photo(pid: int, user=Depends(admin_user)):
     await ws_manager.broadcast({"type": "photo_change", "photo_id": pid})
     return {"ok": True}
 
+
+@app.post("/api/admin/shuffle")
+async def shuffle_photos(user=Depends(admin_user)):
+    """Перемешивает порядок фотографий случайно."""
+    import random
+    db = get_db()
+    ids = [r["id"] for r in db.execute("SELECT id FROM photos").fetchall()]
+    random.shuffle(ids)
+    for new_pos, pid in enumerate(ids):
+        db.execute("UPDATE photos SET position=? WHERE id=?", (new_pos, pid))
+    # перейти на первое фото в новом порядке
+    first = db.execute("SELECT id FROM photos ORDER BY position LIMIT 1").fetchone()
+    if first:
+        set_setting(db, "current_photo_id", str(first["id"]))
+        set_setting(db, "voting_open", "1")
+    db.commit()
+    db.close()
+    if first:
+        await ws_manager.broadcast({"type": "photo_change", "photo_id": first["id"]})
+    return {"ok": True, "count": len(ids), "first_id": first["id"] if first else None}
+
 @app.post("/api/admin/close-voting")
 async def close_voting(user=Depends(admin_user)):
     db = get_db(); set_setting(db, "voting_open", "0"); db.close()
     await ws_manager.broadcast({"type": "voting_closed"})
     return {"ok": True}
+
+@app.post("/api/admin/auto-advance")
+async def set_auto_advance(enabled: bool = Form(...), user=Depends(admin_user)):
+    db = get_db()
+    set_setting(db, "auto_advance", "1" if enabled else "0")
+    db.close()
+    await ws_manager.broadcast({"type": "auto_advance_changed", "enabled": enabled})
+    return {"enabled": enabled}
+
+@app.get("/api/admin/auto-advance")
+def get_auto_advance(user=Depends(admin_user)):
+    db = get_db()
+    val = get_setting(db, "auto_advance") == "1"
+    db.close()
+    return {"enabled": val}
+
+@app.get("/api/online-users")
+def online_users(user=Depends(current_user)):
+    """Возвращает список онлайн-пользователей (не-админов)."""
+    online_ids = ws_manager.online_user_ids()
+    if not online_ids:
+        return {"count": 0, "users": []}
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, username FROM users WHERE is_admin=0 AND id IN ({})".format(
+            ",".join("?" * len(online_ids))
+        ), tuple(online_ids)
+    ).fetchall()
+    db.close()
+    return {"count": len(rows), "users": [dict(r) for r in rows]}
 
 # ── TIERLIST ──────────────────────────────────────────────────────────────────
 
@@ -608,40 +988,6 @@ def tierlist(tag_ids: str = "", exclude_tag_ids: str = "", user=Depends(current_
             "active_tag_ids": selected_tag_ids,
             "excluded_tag_ids": excluded_tag_ids}
 
-
-@app.get("/api/photo-detail/{photo_id}")
-def photo_detail(photo_id: int, user=Depends(current_user)):
-    db = get_db()
-    tiers = get_tiers(db)
-    tier_map = {t["id"]: t for t in tiers}
-
-    # ratings with usernames
-    ratings = db.execute("""
-        SELECT u.username, r.tier_id
-        FROM ratings r JOIN users u ON u.id=r.user_id
-        WHERE r.photo_id=?
-        ORDER BY u.username
-    """, (photo_id,)).fetchall()
-
-    # tags with count
-    tags = db.execute("""
-        SELECT t.name, COUNT(*) as cnt, GROUP_CONCAT(u.username, ', ') as users
-        FROM photo_tags pt
-        JOIN tags t ON t.id=pt.tag_id
-        JOIN users u ON u.id=pt.user_id
-        WHERE pt.photo_id=?
-        GROUP BY t.id
-        ORDER BY cnt DESC, t.name
-    """, (photo_id,)).fetchall()
-
-    db.close()
-    return {
-        "ratings": [{"username": r["username"], "tier_id": r["tier_id"],
-                     "tier_label": tier_map.get(r["tier_id"],{}).get("label", r["tier_id"]),
-                     "tier_color": tier_map.get(r["tier_id"],{}).get("color","#888")} for r in ratings],
-        "tags": [{"name": t["name"], "count": t["cnt"], "users": t["users"]} for t in tags],
-    }
-
 @app.get("/api/stats")
 def stats(user=Depends(admin_user)):
     db = get_db()
@@ -682,6 +1028,154 @@ def list_users(user=Depends(admin_user)):
 def make_admin_user(uid: int, user=Depends(admin_user)):
     db = get_db(); db.execute("UPDATE users SET is_admin=1 WHERE id=?", (uid,)); db.commit(); db.close()
     return {"ok": True}
+
+
+@app.get("/api/users-list")
+def users_list(user=Depends(current_user)):
+    db = get_db()
+    rows = db.execute(
+        "SELECT u.id, u.username, u.is_admin, COUNT(r.id) as vote_count "
+        "FROM users u LEFT JOIN ratings r ON r.user_id=u.id "
+        "GROUP BY u.id ORDER BY vote_count DESC, u.username"
+    ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/user-stats/{uid}")
+def user_stats(uid: int, user=Depends(current_user)):
+    db = get_db()
+    tiers = get_tiers(db)
+    tier_map = {t["id"]: t for t in tiers}
+    tier_order = [t["id"] for t in tiers]
+    n = len(tiers)
+
+    target = db.execute("SELECT id, username FROM users WHERE id=?", (uid,)).fetchone()
+    if not target:
+        db.close()
+        raise HTTPException(404, "User not found")
+
+    tier_counts = {}
+    for row in db.execute("SELECT tier_id, COUNT(*) as cnt FROM ratings WHERE user_id=? GROUP BY tier_id", (uid,)).fetchall():
+        tier_counts[row["tier_id"]] = row["cnt"]
+    total_votes = sum(tier_counts.values())
+
+    user_ratings = db.execute("SELECT photo_id, tier_id FROM ratings WHERE user_id=?", (uid,)).fetchall()
+    agree_score = 0.0
+    total_compared = 0
+    for ur in user_ratings:
+        pid = ur["photo_id"]
+        others = db.execute(
+            "SELECT tier_id, COUNT(*) as cnt FROM ratings WHERE photo_id=? AND user_id!=?",
+            (pid, uid)
+        ).fetchall()
+        if not others:
+            continue
+        total_other = sum(o["cnt"] for o in others)
+        if total_other == 0:   # <-- добавить эту проверку
+            continue
+        same = next((o["cnt"] for o in others if o["tier_id"] == ur["tier_id"]), 0)
+        agree_score += same / total_other
+        # Сколько из других проголосовало так же как этот пользователь
+        same = next((o["cnt"] for o in others if o["tier_id"] == ur["tier_id"]), 0)
+        agree_score += same / total_other
+        total_compared += 1
+
+    agreement_pct = round(agree_score / total_compared * 100) if total_compared else None
+
+    top_n = max(1, n // 2)
+    top_tier_ids = tier_order[:top_n]
+    ph = ",".join("?" * len(top_tier_ids))
+    top_photos = [r["photo_id"] for r in db.execute(
+        f"SELECT photo_id FROM ratings WHERE user_id=? AND tier_id IN ({ph})",
+        [uid] + top_tier_ids
+    ).fetchall()]
+
+    fav_tags = []
+    if top_photos:
+        pp = ",".join("?" * len(top_photos))
+        fav_tags = [dict(r) for r in db.execute(
+            f"SELECT t.name, COUNT(*) as cnt FROM photo_tags pt "
+            f"JOIN tags t ON t.id=pt.tag_id WHERE pt.photo_id IN ({pp}) "
+            f"GROUP BY t.id ORDER BY cnt DESC LIMIT 12",
+            top_photos
+        ).fetchall()]
+
+    db.close()
+    return {
+        "user": {"id": target["id"], "username": target["username"]},
+        "total_votes": total_votes,
+        "tier_counts": [
+            {"tier_id": tid, "label": tier_map.get(tid, {}).get("label", tid),
+             "color": tier_map.get(tid, {}).get("color", "#888"),
+             "count": tier_counts.get(tid, 0)}
+            for tid in tier_order
+        ],
+        "agreement_pct": agreement_pct,
+        "total_compared": total_compared,
+        "fav_tags": fav_tags,
+    }
+
+
+@app.get("/api/compare/{uid1}/{uid2}")
+def compare_users(uid1: int, uid2: int, user=Depends(current_user)):
+    db = get_db()
+    tiers = get_tiers(db)
+    tier_order = [t["id"] for t in tiers]
+    tier_map = {t["id"]: t for t in tiers}
+    n = len(tiers)
+    tier_score = {t["id"]: n - i for i, t in enumerate(tiers)}
+
+    u1 = db.execute("SELECT id, username FROM users WHERE id=?", (uid1,)).fetchone()
+    u2 = db.execute("SELECT id, username FROM users WHERE id=?", (uid2,)).fetchone()
+    if not u1 or not u2:
+        db.close()
+        raise HTTPException(404, "User not found")
+
+    r1 = {r["photo_id"]: r["tier_id"] for r in
+          db.execute("SELECT photo_id, tier_id FROM ratings WHERE user_id=?", (uid1,)).fetchall()}
+    r2 = {r["photo_id"]: r["tier_id"] for r in
+          db.execute("SELECT photo_id, tier_id FROM ratings WHERE user_id=?", (uid2,)).fetchall()}
+
+    common = set(r1.keys()) & set(r2.keys())
+    exact_match = 0
+    close_match = 0
+    disagreements = []
+
+    for pid in common:
+        t1, t2 = r1[pid], r2[pid]
+        diff = abs(tier_score.get(t1, 1) - tier_score.get(t2, 1))
+        if diff == 0:
+            exact_match += 1
+        elif diff == 1:
+            close_match += 1
+        else:
+            photo = db.execute("SELECT filename, original_name FROM photos WHERE id=?", (pid,)).fetchone()
+            if photo:
+                disagreements.append({
+                    "photo_id": pid,
+                    "filename": photo["filename"],
+                    "original_name": photo["original_name"],
+                    "tier1": t1, "label1": tier_map.get(t1, {}).get("label", t1),
+                    "color1": tier_map.get(t1, {}).get("color", "#888"),
+                    "tier2": t2, "label2": tier_map.get(t2, {}).get("label", t2),
+                    "color2": tier_map.get(t2, {}).get("color", "#888"),
+                    "diff": diff,
+                })
+
+    disagreements.sort(key=lambda x: -x["diff"])
+    similarity = round((exact_match + close_match * 0.5) / len(common) * 100) if common else 0
+
+    db.close()
+    return {
+        "user1": {"id": u1["id"], "username": u1["username"]},
+        "user2": {"id": u2["id"], "username": u2["username"]},
+        "common_photos": len(common),
+        "exact_match": exact_match,
+        "close_match": close_match,
+        "similarity": similarity,
+        "disagreements": disagreements[:20],
+    }
 
 app.mount("/photos", StaticFiles(directory=PHOTOS_DIR), name="photos")
 app.mount("/static", StaticFiles(directory="/app/frontend/static"), name="static")

@@ -7,6 +7,7 @@ let tiers = [];
 let pollTimer = null;
 let ws = null;
 let wsReconnectTimer = null;
+let autoAdvanceEnabled = false;
 
 document.addEventListener('DOMContentLoaded', async () => {
   if (token) {
@@ -29,8 +30,9 @@ function showVote() {
   document.getElementById('btn-admin-panel').style.display = me?.is_admin ? '' : 'none';
   document.getElementById('admin-controls').style.display = me?.is_admin ? '' : 'none';
   loadCurrentPhoto(); startPolling();
+  if (me?.is_admin) loadAutoAdvanceState();
 }
-function showAdmin() { clearPolling(); showScreen('admin'); loadPhotos(); loadAdminStats(); renderTierEditor(); }
+function showAdmin() { clearPolling(); showScreen('admin'); loadPhotos(); loadAdminStats(); renderTierEditor(); loadWatchStatus(); }
 
 // ── AUTH ─────────────────────────────────────────────────────────────────────
 function switchTab(tab) {
@@ -189,6 +191,20 @@ function connectWS() {
         selectedTierId = null;
         loadCurrentPhoto();
       }
+      if (msg.type === 'vote_update' || msg.type === 'photo_change') {
+        if (me?.is_admin) loadOnlineUsers();
+      }
+      if (msg.type === 'auto_advance_changed') {
+        autoAdvanceEnabled = msg.enabled;
+        updateAutoAdvanceBtn();
+        if (msg.enabled) loadOnlineUsers();
+        else document.getElementById('online-users-bar').style.display = 'none';
+      }
+      if (msg.type === 'all_done') {
+        selectedTierId = null;
+        loadCurrentPhoto();
+        if (me?.is_admin) toast('Все фото просмотрены!', 'ok');
+      }
     } catch {}
   };
 
@@ -216,6 +232,86 @@ async function closeVoting() {
   try { await req('POST','/api/admin/close-voting'); toast('Закрыто','ok'); loadCurrentPhoto(); }
   catch(e) { toast(e.message,'err'); }
 }
+
+async function shufflePhotos() {
+  if (!confirm('Перемешать все фотографии в случайном порядке и начать с первой?')) return;
+  try {
+    const d = await req('POST', '/api/admin/shuffle');
+    toast(`Перемешано ${d.count} фото 🔀`, 'ok');
+    selectedTierId = null;
+    loadCurrentPhoto();
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+async function toggleAutoAdvance() {
+  try {
+    const newState = !autoAdvanceEnabled;
+    await formReq('/api/admin/auto-advance', { enabled: newState });
+    autoAdvanceEnabled = newState;
+    updateAutoAdvanceBtn();
+    toast(newState ? '⚡ Авто-переход включён' : 'Авто-переход выключен', 'ok');
+    if (newState) loadOnlineUsers();
+    else document.getElementById('online-users-bar').style.display = 'none';
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+function updateAutoAdvanceBtn() {
+  const btn = document.getElementById('auto-advance-btn');
+  if (!btn) return;
+  if (autoAdvanceEnabled) {
+    btn.classList.add('active');
+    btn.title = 'Авто-переход ВКЛЮЧЁН — выключить';
+  } else {
+    btn.classList.remove('active');
+    btn.title = 'Авто-переход выключен — включить';
+  }
+}
+
+async function loadAutoAdvanceState() {
+  if (!me?.is_admin) return;
+  try {
+    const d = await req('GET', '/api/admin/auto-advance');
+    autoAdvanceEnabled = d.enabled;
+    updateAutoAdvanceBtn();
+    if (d.enabled) loadOnlineUsers();
+  } catch {}
+}
+
+async function loadOnlineUsers() {
+  if (!me?.is_admin) return;
+  const bar = document.getElementById('online-users-bar');
+  if (!autoAdvanceEnabled) { bar.style.display = 'none'; return; }
+  try {
+    const d = await req('GET', '/api/online-users');
+    if (!d.count) {
+      bar.innerHTML = '<span class="online-label">Онлайн: нет участников</span>';
+    } else {
+      bar.innerHTML = `<span class="online-label">Онлайн (${d.count}):</span> ` +
+        d.users.map(u => `<span class="online-user">${u.username}</span>`).join('');
+    }
+    bar.style.display = '';
+  } catch {}
+}
+
+// ── HOTKEYS ───────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  // не срабатывает в полях ввода
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  // не срабатывает если открыто модальное окно
+  if (document.getElementById('photo-modal')?.style.display !== 'none') return;
+  // только на экране голосования
+  if (!document.getElementById('screen-vote')?.classList.contains('active')) return;
+
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+    if (me?.is_admin) { e.preventDefault(); nextPhoto(); }
+  } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+    if (me?.is_admin) { e.preventDefault(); prevPhoto(); }
+  } else if (e.key === ' ' || e.key === 'Enter') {
+    // пробел/Enter — подтвердить оценку
+    const btn = document.getElementById('btn-vote');
+    if (btn && !btn.disabled) { e.preventDefault(); submitVote(); }
+  }
+});
 
 // ── TIER EDITOR ───────────────────────────────────────────────────────────────
 const PALETTE = ['#ff6b6b','#ff8c42','#ffd43b','#a9e34b','#4ae8a0','#74c0fc','#a78bfa','#f472b6','#94a3b8','#ffffff'];
@@ -673,6 +769,161 @@ function tierTextColor(hex) {
 
 
 
+
+// ── STATS SCREEN ─────────────────────────────────────────────────────────────
+
+let selectedUserId = null;
+let compareUserId = null;
+let usersList = [];
+
+function showStats() {
+  clearPolling();
+  showScreen('stats');
+  loadUsersList();
+}
+
+async function loadUsersList() {
+  try {
+    usersList = await req('GET', '/api/users-list');
+    const el = document.getElementById('users-list');
+    if (!usersList.length) {
+      el.innerHTML = '<div class="stats-empty">Нет участников</div>';
+      return;
+    }
+    el.innerHTML = usersList.map(u => `
+      <div class="user-item ${u.id === selectedUserId ? 'active' : ''}"
+           onclick="selectUser(${u.id})">
+        <span class="user-item-name">${u.username}${u.is_admin ? ' <span class="user-admin-badge">admin</span>' : ''}</span>
+        <span class="user-item-votes">${u.vote_count} гол.</span>
+      </div>`).join('');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+async function selectUser(uid) {
+  selectedUserId = uid;
+  compareUserId = null;
+  // highlight
+  document.querySelectorAll('.user-item').forEach(el => {
+    el.classList.toggle('active', parseInt(el.dataset?.id || el.onclick?.toString().match(/\d+/)?.[0]) === uid);
+  });
+  await loadUsersList(); // re-render to update active state
+  await loadUserProfile(uid);
+}
+
+async function loadUserProfile(uid) {
+  const el = document.getElementById('stats-content');
+  el.innerHTML = '<div class="stats-loading">Загрузка...</div>';
+  try {
+    const d = await req('GET', `/api/user-stats/${uid}`);
+    const totalVotes = d.total_votes;
+
+    const tierBars = d.tier_counts.map(t => {
+      const pct = totalVotes ? Math.round(t.count / totalVotes * 100) : 0;
+      const textCol = tierTextColor(t.color.length === 7 ? t.color : '#888888');
+      return `<div class="stat-tier-row">
+        <span class="stat-tier-label" style="background:${t.color};color:${textCol}">${t.label}</span>
+        <div class="stat-tier-bar-wrap">
+          <div class="stat-tier-bar" style="width:${pct}%;background:${t.color}"></div>
+        </div>
+        <span class="stat-tier-count">${t.count}</span>
+      </div>`;
+    }).join('');
+
+    const tagsHtml = d.fav_tags.length
+      ? d.fav_tags.map(t => `<span class="stat-tag">${t.name} <span class="stat-tag-cnt">${t.cnt}</span></span>`).join('')
+      : '<span class="stats-empty-sm">Нет данных</span>';
+
+    const agreement = d.agreement_pct !== null
+      ? `<div class="stat-agree">
+          <div class="stat-agree-pct" style="color:${d.agreement_pct >= 60 ? 'var(--success)' : d.agreement_pct >= 40 ? 'var(--accent)' : 'var(--danger)'}">${d.agreement_pct}%</div>
+          <div class="stat-agree-label">совпадение с другими<br><span style="color:var(--muted);font-size:.75rem">(по ${d.total_compared} фото с чужими оценками)</span></div>
+        </div>`
+      : '<span class="stats-empty-sm">Недостаточно данных</span>';
+
+    // compare buttons — other users
+    const compareList = usersList.filter(u => u.id !== uid).map(u => `
+      <button class="compare-btn ${u.id === compareUserId ? 'active' : ''}"
+              onclick="loadCompare(${uid}, ${u.id})">${u.username}</button>`).join('');
+
+    el.innerHTML = `
+      <div class="profile-header">
+        <div class="profile-avatar">${d.user.username[0].toUpperCase()}</div>
+        <div>
+          <div class="profile-name">${d.user.username}</div>
+          <div class="profile-sub">Оценено фото: <b>${totalVotes}</b></div>
+        </div>
+      </div>
+
+      <div class="stats-grid-2">
+        <div class="stat-card">
+          <div class="stat-card-title">Распределение оценок</div>
+          <div class="stat-tier-bars">${tierBars}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-title">Совпадение с большинством</div>
+          ${agreement}
+        </div>
+      </div>
+
+      <div class="stat-card" style="margin-top:12px">
+        <div class="stat-card-title">Любимые теги (топ фото)</div>
+        <div class="stat-tags-wrap">${tagsHtml}</div>
+      </div>
+
+      ${usersList.filter(u => u.id !== uid).length ? `
+      <div class="stat-card" style="margin-top:12px">
+        <div class="stat-card-title">Сравнить с пользователем</div>
+        <div class="compare-btns">${compareList}</div>
+        <div id="compare-result"></div>
+      </div>` : ''}
+    `;
+  } catch(e) {
+    el.innerHTML = `<div class="stats-empty">${e.message}</div>`;
+  }
+}
+
+async function loadCompare(uid1, uid2) {
+  compareUserId = uid2;
+  // re-render compare buttons
+  document.querySelectorAll('.compare-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.textContent.trim() === usersList.find(u => u.id === uid2)?.username);
+  });
+  const el = document.getElementById('compare-result');
+  if (!el) return;
+  el.innerHTML = '<div class="stats-loading" style="margin-top:10px">Загрузка...</div>';
+  try {
+    const d = await req('GET', `/api/compare/${uid1}/${uid2}`);
+    const simColor = d.similarity >= 70 ? 'var(--success)' : d.similarity >= 40 ? 'var(--accent)' : 'var(--danger)';
+
+    const disHtml = d.disagreements.length ? d.disagreements.map(p => `
+      <div class="disagree-row">
+        <img src="/photos/${p.filename}" class="disagree-img" onclick="openPhotoModal(${p.photo_id},'${p.filename}')">
+        <div class="disagree-tiers">
+          <span class="modal-tier-badge" style="background:${p.color1};color:${tierTextColor(p.color1)}">${p.label1}</span>
+          <span style="color:var(--muted);font-size:.8rem">vs</span>
+          <span class="modal-tier-badge" style="background:${p.color2};color:${tierTextColor(p.color2)}">${p.label2}</span>
+        </div>
+      </div>`).join('')
+    : '<span class="stats-empty-sm">Разногласий нет</span>';
+
+    el.innerHTML = `
+      <div class="compare-summary">
+        <div class="compare-sim" style="color:${simColor}">${d.similarity}%<span>схожесть</span></div>
+        <div class="compare-nums">
+          <span>✅ Совпало: <b>${d.exact_match}</b></span>
+          <span>〰️ Близко: <b>${d.close_match}</b></span>
+          <span>❌ Расхождение: <b>${d.disagreements.length}</b></span>
+          <span style="color:var(--muted)">Общих фото: ${d.common_photos}</span>
+        </div>
+      </div>
+      ${d.disagreements.length ? `<div class="stat-card-title" style="margin:10px 0 6px">Главные расхождения</div>
+      <div class="disagree-list">${disHtml}</div>` : ''}
+    `;
+  } catch(e) {
+    el.innerHTML = `<div class="stats-empty">${e.message}</div>`;
+  }
+}
+
 // ── PHOTO MODAL ───────────────────────────────────────────────────────────────
 
 async function openPhotoModal(photoId, filename) {
@@ -827,6 +1078,147 @@ document.addEventListener('click', e => {
     if (d) d.style.display = 'none';
   }
 });
+
+// ── YANDEX DISK AUTO-SYNC ─────────────────────────────────────────────────────
+async function loadWatchStatus() {
+  try {
+    const d = await req('GET', '/api/admin/yadisk-watch');
+    const status = document.getElementById('watch-status');
+    const syncBtn = document.getElementById('watch-sync-now-btn');
+    const delBtn = document.getElementById('watch-delete-btn');
+    if (!d) {
+      status.innerHTML = '<span class="watch-off">⬤ Выключено</span>';
+      syncBtn.style.display = 'none';
+      delBtn.style.display = 'none';
+      return;
+    }
+    document.getElementById('watch-url').value = d.public_url || '';
+    const sel = document.getElementById('watch-interval');
+    [...sel.options].forEach(o => { if (parseInt(o.value) === d.interval_minutes) o.selected = true; });
+    const lastSync = d.last_sync_at
+      ? new Date(d.last_sync_at + 'Z').toLocaleString('ru')
+      : 'ещё не было';
+    const added = d.last_sync_added ?? 0;
+    const errors = d.last_sync_errors ?? 0;
+    const nextSync = d.last_sync_at
+      ? new Date(new Date(d.last_sync_at + 'Z').getTime() + d.interval_minutes * 60000).toLocaleString('ru')
+      : 'скоро';
+    let syncInfo = added === -1
+      ? `<span class="watch-err">ошибка последней синхронизации</span>`
+      : `добавлено: <b>${added}</b>${errors ? `, ошибок: ${errors}` : ''}`;
+    status.innerHTML = `<span class="watch-on">⬤ Активно</span> · проверка каждые <b>${d.interval_minutes} мин</b><br>
+      <span class="watch-meta">Последняя: ${lastSync} (${syncInfo})</span><br>
+      <span class="watch-meta">Следующая: ${nextSync}</span>`;
+    syncBtn.style.display = '';
+    delBtn.style.display = '';
+  } catch(e) {
+    document.getElementById('watch-status').textContent = '';
+  }
+}
+
+async function saveWatchUrl() {
+  const url = document.getElementById('watch-url').value.trim();
+  if (!url) { toast('Введите ссылку', 'err'); return; }
+  const interval = document.getElementById('watch-interval').value;
+  try {
+    await formReq('/api/admin/yadisk-watch', { public_url: url, interval_minutes: interval });
+    toast('Авто-синхронизация включена! Первая проверка запущена.', 'ok');
+    loadWatchStatus();
+  } catch(e) { toast(e.message || 'Ошибка', 'err'); }
+}
+
+async function deleteWatchUrl() {
+  if (!confirm('Отключить авто-синхронизацию?')) return;
+  try {
+    await req('DELETE', '/api/admin/yadisk-watch');
+    toast('Авто-синхронизация отключена', 'ok');
+    document.getElementById('watch-url').value = '';
+    loadWatchStatus();
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+async function watchSyncNow() {
+  const btn = document.getElementById('watch-sync-now-btn');
+  btn.disabled = true; btn.textContent = '↻ Проверяю...';
+  try {
+    const d = await req('POST', '/api/admin/yadisk-watch/sync-now');
+    toast(`Готово: добавлено ${d.added}, пропущено ${d.skipped}` + (d.errors ? `, ошибок ${d.errors}` : ''), 'ok');
+    loadWatchStatus();
+    if (d.added > 0) loadPhotos();
+  } catch(e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '↻ Проверить сейчас'; }
+}
+
+// ── YANDEX DISK IMPORT ────────────────────────────────────────────────────────
+async function previewYadisk() {
+  const url = document.getElementById('yadisk-url').value.trim();
+  if (!url) { toast('Введите ссылку на папку Яндекс.Диска', 'err'); return; }
+  const preview = document.getElementById('yadisk-preview');
+  const importBtn = document.getElementById('yadisk-import-btn');
+  preview.style.display = '';
+  preview.textContent = 'Загрузка списка файлов...';
+  importBtn.style.display = 'none';
+  try {
+    const data = await req('GET', '/api/admin/preview-yadisk?public_url=' + encodeURIComponent(url));
+    if (data.total === 0) {
+      preview.textContent = 'Файлов не найдено. Проверьте ссылку и доступ к папке.';
+      return;
+    }
+    let html = `<div class="yadisk-summary">Найдено: ${data.total} фото, новых: <b>${data.new}</b></div>`;
+    html += '<div class="yadisk-file-list">';
+    data.files.forEach(f => {
+      const kb = Math.round(f.size / 1024);
+      const rowClass = f.exists ? 'exists' : 'new';
+      const status = f.exists ? 'уже есть' : 'новое';
+      html += `<div class="yadisk-file-row ${rowClass}">
+        <span class="yadisk-file-name">${f.name}</span>
+        <span class="yadisk-file-size">${kb} KB</span>
+        <span class="yadisk-file-status">${status}</span>
+      </div>`;
+    });
+    if (data.total > data.files.length) html += `<div class="yadisk-more">… и ещё ${data.total - data.files.length} файлов</div>`;
+    html += '</div>';
+    preview.innerHTML = html;
+    if (data.new > 0) importBtn.style.display = '';
+  } catch(e) {
+    preview.innerHTML = `<div class="yadisk-error">Ошибка: ${e.message || e}</div>`;
+    importBtn.style.display = 'none';
+  }
+}
+
+async function importYadisk() {
+  const url = document.getElementById('yadisk-url').value.trim();
+  if (!url) { toast('Введите ссылку на папку Яндекс.Диска', 'err'); return; }
+  const progress = document.getElementById('yadisk-progress');
+  const label = document.getElementById('yadisk-label');
+  const fill = document.getElementById('yadisk-fill');
+  const importBtn = document.getElementById('yadisk-import-btn');
+  importBtn.style.display = 'none';
+  progress.style.display = '';
+  label.textContent = 'Идёт импорт, подождите...';
+  fill.style.width = '100%';
+  try {
+    const fd = new FormData();
+    fd.append('public_url', url);
+    const resp = await fetch(API + '/api/admin/import-yadisk', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token },
+      body: fd
+    });
+    const text = await resp.text();
+    let json; try { json = JSON.parse(text); } catch { json = text; }
+    if (!resp.ok) throw new Error(json?.detail || json || resp.statusText);
+    label.textContent = `Готово! Добавлено: ${json.added}, пропущено: ${json.skipped}, ошибок: ${json.errors}`;
+    fill.style.animation = 'none';
+    fill.style.width = '100%';
+    setTimeout(() => { progress.style.display = 'none'; }, 4000);
+    loadPhotos();
+  } catch(e) {
+    label.textContent = 'Ошибка: ' + (e.message || e);
+    fill.style.width = '0%';
+    setTimeout(() => { progress.style.display = 'none'; importBtn.style.display = ''; }, 4000);
+  }
+}
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 async function req(method, url, body) {

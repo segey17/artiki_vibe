@@ -41,6 +41,7 @@
       <nav class="topbar-nav">
         <span id="nav-username"></span>
         <button class="nav-btn" onclick="showTierlist()" title="Тир-лист">🏆</button>
+        <button class="nav-btn" onclick="showStats()" title="Статистика">📊</button>
         <button class="nav-btn" id="btn-admin-panel" onclick="showAdmin()" title="Админ" style="display:none">⚙️</button>
         <button class="nav-btn" onclick="logout()" title="Выйти">⏻</button>
       </nav>
@@ -91,11 +92,14 @@
       <div id="admin-controls" class="admin-bar" style="display:none">
         <div class="admin-bar-title">⚙️ Управление</div>
         <div class="admin-bar-btns">
-          <button class="admin-btn" onclick="prevPhoto()">← Назад</button>
-          <button class="admin-btn accent" onclick="nextPhoto()">Вперёд →</button>
+          <button class="admin-btn" onclick="prevPhoto()" title="← или стрелка влево">← Назад</button>
+          <button class="admin-btn accent" onclick="nextPhoto()" title="→ или стрелка вправо">Вперёд →</button>
           <button class="admin-btn" onclick="closeVoting()">🔒 Закрыть голос.</button>
+          <button class="admin-btn" onclick="shufflePhotos()" title="Перемешать все фото случайно">🔀 Перемешать</button>
+          <button class="admin-btn" id="auto-advance-btn" onclick="toggleAutoAdvance()" title="Авто-переход когда все онлайн проголосовали">⚡ Авто-переход</button>
         </div>
         <div class="admin-stats" id="admin-stats"></div>
+        <div id="online-users-bar" class="online-users-bar" style="display:none"></div>
       </div>
     </main>
   </div>
@@ -143,6 +147,37 @@
     </main>
   </div>
 
+
+  <!-- STATS -->
+  <div id="screen-stats" class="screen">
+    <header class="topbar">
+      <div class="logo-sm">PHOTO<span>RANK</span></div>
+      <nav class="topbar-nav">
+        <button class="nav-btn" onclick="showVote()">← Назад</button>
+        <button class="nav-btn" onclick="logout()">⏻</button>
+      </nav>
+    </header>
+    <main class="stats-main">
+      <div class="stats-layout">
+
+        <!-- Список пользователей -->
+        <div class="stats-sidebar">
+          <div class="stats-section-title">Участники</div>
+          <div id="users-list" class="users-list"></div>
+        </div>
+
+        <!-- Профиль пользователя -->
+        <div class="stats-content" id="stats-content">
+          <div class="stats-placeholder">
+            <div style="font-size:3rem">👆</div>
+            <p>Выберите участника чтобы увидеть статистику</p>
+          </div>
+        </div>
+
+      </div>
+    </main>
+  </div>
+
   <!-- ADMIN -->
   <div id="screen-admin" class="screen">
     <header class="topbar">
@@ -169,6 +204,44 @@
           <h2>🗑️ Сброс базы данных</h2>
           <p class="hint">Удалит всех пользователей (кроме администраторов), все фотографии и оценки. Действие необратимо.</p>
           <button class="btn-danger" onclick="resetDB()">Полностью очистить БД</button>
+        </div>
+
+        <div class="admin-card">
+          <h2>☁️ Импорт с Яндекс.Диска</h2>
+          <p class="hint">Вставьте ссылку на публичную папку. Уже загруженные фото (по имени файла) будут пропущены.</p>
+          <div class="yadisk-input-row">
+            <input type="text" id="yadisk-url" placeholder="https://disk.yandex.ru/d/..." class="yadisk-input">
+            <button class="btn-secondary" onclick="previewYadisk()">Проверить</button>
+          </div>
+          <div id="yadisk-preview" class="yadisk-preview" style="display:none"></div>
+          <button class="btn-primary mt" id="yadisk-import-btn" onclick="importYadisk()" style="display:none">
+            Импортировать
+          </button>
+          <div class="upload-progress" id="yadisk-progress" style="display:none">
+            <div class="up-bar"><div class="up-fill" id="yadisk-fill" style="width:100%;animation:pulse 1.5s infinite"></div></div>
+            <div class="up-label" id="yadisk-label">Идёт импорт, подождите...</div>
+          </div>
+        </div>
+
+        <div class="admin-card">
+          <h2>🔄 Авто-синхронизация с Яндекс.Диском</h2>
+          <p class="hint">Сервис будет автоматически проверять папку и загружать новые фото без участия администратора.</p>
+          <div id="watch-status" class="watch-status"></div>
+          <div class="yadisk-input-row">
+            <input type="text" id="watch-url" placeholder="https://disk.yandex.ru/d/..." class="yadisk-input">
+            <select id="watch-interval" class="watch-interval-select">
+              <option value="15">каждые 15 мин</option>
+              <option value="30">каждые 30 мин</option>
+              <option value="60" selected>каждый час</option>
+              <option value="180">каждые 3 часа</option>
+              <option value="360">каждые 6 часов</option>
+            </select>
+          </div>
+          <div class="watch-btns">
+            <button class="btn-primary" onclick="saveWatchUrl()">💾 Сохранить и включить</button>
+            <button class="btn-secondary" id="watch-sync-now-btn" onclick="watchSyncNow()" style="display:none">↻ Проверить сейчас</button>
+            <button class="btn-danger" id="watch-delete-btn" onclick="deleteWatchUrl()" style="display:none">✕ Отключить</button>
+          </div>
         </div>
 
         <div class="admin-card">
