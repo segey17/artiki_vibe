@@ -9,6 +9,87 @@ let ws = null;
 let wsReconnectTimer = null;
 let autoAdvanceEnabled = false;
 
+// ── THEME ────────────────────────────────────────────────────────────────
+// Тема применяется максимально рано (см. инлайн-скрипт в <head> index.html),
+// здесь только переключение по клику и синхронизация иконок кнопок.
+function applyThemeIcons() {
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  document.querySelectorAll('.theme-toggle-icon-target')
+    .forEach(btn => { btn.textContent = isDark ? '☀️' : '🌙'; });
+}
+function toggleTheme() {
+  const root = document.documentElement;
+  const isDark = root.getAttribute('data-theme') === 'dark';
+  const next = isDark ? 'light' : 'dark';
+  root.setAttribute('data-theme', next);
+  try { localStorage.setItem('theme', next); } catch {}
+  applyThemeIcons();
+}
+applyThemeIcons();
+
+// ── PHOTO CACHE / PRELOADING ───────────────────────────────────────────────
+// Кэш уже загруженных изображений (filename -> Image), чтобы при перелистывании
+// фото не было "ожидания" — браузер отдаёт картинку из памяти/кэша мгновенно.
+const photoImgCache = new Map();
+let currentPhotoFilename = null;     // имя файла текущего показанного фото
+let pendingNavDirection = null;      // 'next' | 'prev' | null — куда листаем (для анимации)
+
+function preloadPhoto(filename) {
+  if (!filename || photoImgCache.has(filename)) return;
+  const img = new Image();
+  img.src = `/photos/${filename}`;
+  photoImgCache.set(filename, img);
+}
+
+// Меняет фото в #current-photo-img с анимацией перелистывания.
+// Если картинка уже в кэше (была предзагружена) — браузер берёт её
+// из памяти и показывает мгновенно, без "мигания"/ожидания.
+function setPhotoImage(filename) {
+  const frame = document.getElementById('photo-frame') || document.querySelector('.photo-frame');
+  const imgEl = document.getElementById('current-photo-img');
+  if (!imgEl) return;
+
+  const direction = pendingNavDirection; // 'next' | 'prev' | null
+  pendingNavDirection = null;
+
+  const url = `/photos/${filename}`;
+  currentPhotoFilename = filename;
+
+  // сбрасываем индикатор ошибки от предыдущего фото
+  imgEl.classList.remove('img-error');
+  const errHint = document.getElementById('photo-error-hint');
+  if (errHint) errHint.style.display = 'none';
+  imgEl.onerror = () => {
+    imgEl.classList.add('img-error');
+    if (errHint) errHint.style.display = '';
+  };
+
+  // гарантируем, что картинка есть в кэше браузера (создаёт Image, если не было)
+  preloadPhoto(filename);
+
+  const outClass = direction === 'prev' ? 'photo-anim-out-right' : 'photo-anim-out-left';
+  const inClass  = direction === 'prev' ? 'photo-anim-in-left'  : 'photo-anim-in-right';
+
+  if (!direction || !frame) {
+    // первая загрузка / неизвестное направление — без анимации выезда
+    imgEl.src = url;
+    return;
+  }
+
+  frame.classList.remove('photo-anim-out-left', 'photo-anim-out-right', 'photo-anim-in-left', 'photo-anim-in-right');
+  frame.classList.add(outClass);
+
+  const swap = () => {
+    imgEl.src = url;
+    frame.classList.remove(outClass);
+    frame.classList.add(inClass);
+    setTimeout(() => frame.classList.remove(inClass), 260);
+  };
+
+  // ждём конца анимации "выезда", затем подставляем новую картинку и "въезжаем"
+  setTimeout(swap, 180);
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
   if (token) {
     try {
@@ -32,7 +113,7 @@ function showVote() {
   loadCurrentPhoto(); startPolling();
   if (me?.is_admin) loadAutoAdvanceState();
 }
-function showAdmin() { clearPolling(); showScreen('admin'); loadPhotos(); loadAdminStats(); renderTierEditor(); loadWatchStatus(); }
+function showAdmin() { clearPolling(); showScreen('admin'); loadPhotos(); loadAdminStats(); renderTierEditor(); loadWatchStatus(); loadGdriveWatchStatus(); loadWd14Status(); checkDuplicatePhotos(); }
 
 // ── AUTH ─────────────────────────────────────────────────────────────────────
 function switchTab(tab) {
@@ -85,7 +166,8 @@ function renderCurrentPhoto(data) {
   if (!photo) return;
 
   // reset votes list on photo change
-  if (currentPhotoId !== photo.id) {
+  const photoChanged = currentPhotoId !== photo.id;
+  if (photoChanged) {
     votesListOpen = false;
     const list = document.getElementById('votes-list');
     const label = document.getElementById('votes-toggle-label');
@@ -93,7 +175,15 @@ function renderCurrentPhoto(data) {
     if (label) label.textContent = 'Показать голоса ▾';
   }
   currentPhotoId = photo.id;
-  document.getElementById('current-photo-img').src = `/photos/${photo.filename}`;
+
+  if (photoChanged) {
+    setPhotoImage(photo.filename);
+  }
+
+  // предзагружаем соседние фото в кэш, чтобы следующее перелистывание было мгновенным
+  preloadPhoto(data.next_filename);
+  preloadPhoto(data.prev_filename);
+
   document.getElementById('photo-name').textContent = photo.original_name || photo.filename;
 
   const voteCount = photo.vote_count || 0;
@@ -134,7 +224,7 @@ function renderVoteBtns(activeId, locked, counts = {}) {
     return `<button class="tier-vote-btn ${isActive?'active':''}"
       data-id="${t.id}"
       style="--tc:${t.color}"
-      onclick="${locked ? '' : `selectTier('${t.id}')`}"
+      onclick="${locked ? '' : `selectTier('${t.id}', event)`}"
       ${locked ? 'disabled' : ''}>
       <span class="tvb-swatch"></span>
       <span class="tvb-label">${t.label}</span>
@@ -143,13 +233,29 @@ function renderVoteBtns(activeId, locked, counts = {}) {
   }).join('');
 }
 
-function selectTier(id) {
+function selectTier(id, evt) {
   selectedTierId = id;
   renderVoteBtns(id, false);
   const t = tiers.find(t => t.id === id);
   const btn = document.getElementById('btn-vote');
   btn.disabled = false;
   btn.textContent = `Поставить: ${t?.label || id}`;
+
+  // ripple-вспышка от точки клика
+  const target = evt?.currentTarget || document.querySelector(`.tier-vote-btn[data-id="${id}"]`);
+  if (target) {
+    const rect = target.getBoundingClientRect();
+    const x = (evt?.clientX ?? rect.left + rect.width/2) - rect.left;
+    const y = (evt?.clientY ?? rect.top + rect.height/2) - rect.top;
+    const ripple = document.createElement('span');
+    ripple.className = 'tvb-ripple';
+    ripple.style.left = x + 'px';
+    ripple.style.top = y + 'px';
+    ripple.style.width = ripple.style.height = '14px';
+    ripple.style.marginLeft = ripple.style.marginTop = '-7px';
+    target.appendChild(ripple);
+    setTimeout(() => ripple.remove(), 600);
+  }
 }
 
 async function submitVote() {
@@ -189,6 +295,7 @@ function connectWS() {
       const msg = JSON.parse(e.data);
       if (msg.type === 'photo_change' || msg.type === 'voting_closed' || msg.type === 'vote_update') {
         selectedTierId = null;
+        if (msg.type === 'photo_change') pendingNavDirection = msg.direction || 'next';
         loadCurrentPhoto();
       }
       if (msg.type === 'vote_update' || msg.type === 'photo_change') {
@@ -221,11 +328,11 @@ async function nextPhoto() {
   try {
     const d = await req('POST', '/api/admin/next-photo');
     if (d.done) toast('Все фотографии просмотрены!', 'ok');
-    else { selectedTierId = null; loadCurrentPhoto(); }
+    else { selectedTierId = null; pendingNavDirection = 'next'; loadCurrentPhoto(); }
   } catch(e) { toast(e.message,'err'); }
 }
 async function prevPhoto() {
-  try { await req('POST', '/api/admin/prev-photo'); selectedTierId=null; loadCurrentPhoto(); }
+  try { await req('POST', '/api/admin/prev-photo'); selectedTierId=null; pendingNavDirection = 'prev'; loadCurrentPhoto(); }
   catch(e) { toast(e.message||'Уже первая','err'); }
 }
 async function closeVoting() {
@@ -672,14 +779,14 @@ async function exportPNG() {
   canvas.width = canvasW; canvas.height = canvasH;
   const ctx = canvas.getContext('2d');
 
-  ctx.fillStyle = '#0a0a0b';
+  ctx.fillStyle = '#f5f5f7';
   ctx.fillRect(0, 0, canvasW, canvasH);
 
-  ctx.fillStyle = '#f0f0f0';
+  ctx.fillStyle = '#1d1d1f';
   ctx.font = 'bold 20px sans-serif';
   ctx.fillText('Тир-лист результатов', PAD, 30);
   if (tagLabel) {
-    ctx.fillStyle = '#e8c84a';
+    ctx.fillStyle = '#0071e3';
     ctx.font = '13px sans-serif';
     ctx.fillText(tagLabel, PAD, 50);
   }
@@ -1005,20 +1112,21 @@ function renderTags() {
   const sel = document.getElementById('tags-selected');
   if (!sel) return;
 
-  // my tags as removable chips
+  // мои подтверждённые теги — съёмные чипы
   const myHtml = myTags.map(t => `
     <span class="tag-chip mine" title="Нажмите чтобы удалить">
       ${t.name}
       <span class="tag-remove" onclick="removeTag(${t.id})">×</span>
     </span>`).join('');
 
-  // other users' tags grouped
+  // подтверждённые теги других пользователей, сгруппированные по имени
+  const myTagNames = new Set(myTags.map(t => t.name));
+  const confirmed = allPhotoTags.filter(r => !r.is_suggestion);
   const others = {};
-  allPhotoTags.forEach(r => {
+  confirmed.forEach(r => {
     if (!others[r.tag_name]) others[r.tag_name] = [];
     others[r.tag_name].push(r.username);
   });
-  const myTagNames = new Set(myTags.map(t => t.name));
   const othersHtml = Object.entries(others)
     .filter(([name]) => !myTagNames.has(name))
     .map(([name, users]) => `
@@ -1027,7 +1135,32 @@ function renderTags() {
         ${name} <span class="tag-users">${users.length}</span>
       </span>`).join('');
 
-  sel.innerHTML = myHtml + othersHtml;
+  // предложения от автотегирования — отдельная группа с кнопками подтвердить/отклонить.
+  // Если тег уже подтверждён (есть среди myTags/others), повторно как suggestion не показываем —
+  // это та же самая запись в БД, просто её is_suggestion уже снят.
+  const suggestions = allPhotoTags.filter(r => r.is_suggestion);
+  const suggestionsHtml = suggestions.map(r => `
+      <span class="tag-chip suggestion" title="Предложено автотегированием — подтвердите или отклоните">
+        <span class="ai-badge">AI</span> ${r.tag_name}
+        <span class="tag-confirm" onclick="confirmSuggestedTag(${r.tag_id})" title="Подтвердить">✓</span>
+        <span class="tag-reject" onclick="rejectSuggestedTag(${r.tag_id})" title="Отклонить">✕</span>
+      </span>`).join('');
+
+  sel.innerHTML = myHtml + othersHtml + suggestionsHtml;
+}
+
+async function confirmSuggestedTag(tagId) {
+  try {
+    await formReq(`/api/photo-tags/${currentPhotoId}/confirm`, { tag_id: tagId });
+    loadTags();
+  } catch(e) { toast(e.message || 'Ошибка', 'err'); }
+}
+
+async function rejectSuggestedTag(tagId) {
+  try {
+    await formReq(`/api/photo-tags/${currentPhotoId}/reject`, { tag_id: tagId });
+    loadTags();
+  } catch(e) { toast(e.message || 'Ошибка', 'err'); }
 }
 
 function searchTags(q) {
@@ -1127,6 +1260,71 @@ async function saveWatchUrl() {
   } catch(e) { toast(e.message || 'Ошибка', 'err'); }
 }
 
+function formatBytes(n) {
+  if (!n) return '0';
+  if (n < 1024) return `${n} Б`;
+  if (n < 1024*1024) return `${(n/1024).toFixed(0)} КБ`;
+  return `${(n/1024/1024).toFixed(1)} МБ`;
+}
+
+async function loadWd14Status() {
+  const el = document.getElementById('wd14-status-content');
+  if (!el) return;
+  try {
+    const d = await req('GET', '/api/admin/wd14-status');
+    if (d.available) {
+      el.innerHTML = `<span class="watch-on">⬤ Модель загружена и работает</span><br>
+        <span class="watch-meta">model.onnx: ${formatBytes(d.model_size_bytes)} · selected_tags.csv: ${formatBytes(d.tags_size_bytes)}</span>`;
+    } else {
+      // Различаем "файлов вообще нет" и "файлы есть, но это LFS-указатели 0 КБ" —
+      // вторая ситуация встречается очень часто при неправильном скачивании с HuggingFace.
+      const looksLikePointer = d.model_size_bytes > 0 && d.model_size_bytes < 50*1024*1024;
+      const hint = looksLikePointer
+        ? `Файл model.onnx весит всего ${formatBytes(d.model_size_bytes)} — это похоже на LFS/Xet-указатель, а не на реальную модель (~388 МБ). Скачайте файл заново по прямой ссылке (.../resolve/main/model.onnx), а не через предпросмотр страницы.`
+        : `Файлы model.onnx и selected_tags.csv не найдены в wd14_model/. Автотеги не проставляются, но загрузка фото работает как обычно.`;
+      el.innerHTML = `<span class="watch-off">⬤ Модель не подключена</span><br>
+        <span class="watch-meta">${hint}</span>`;
+    }
+  } catch(e) {
+    el.textContent = '';
+  }
+}
+
+async function checkDuplicatePhotos() {
+  const statusEl = document.getElementById('duplicate-status');
+  const mergeBtn = document.getElementById('merge-duplicates-btn');
+  if (!statusEl) return;
+  try {
+    const d = await req('GET', '/api/admin/duplicate-photos');
+    if (d.groups === 0) {
+      statusEl.innerHTML = '<span class="watch-on">⬤ Дублей не найдено</span>';
+      mergeBtn.style.display = 'none';
+    } else {
+      statusEl.innerHTML = `<span class="watch-off">⬤ Найдено ${d.groups} групп дублей, лишних фото: ${d.extra_photos}</span>`;
+      mergeBtn.style.display = '';
+    }
+  } catch(e) {
+    statusEl.textContent = '';
+  }
+}
+
+async function mergeDuplicatePhotos() {
+  if (!confirm('Объединить дубли? Лишние копии будут удалены, а их голоса и теги перенесены на оставшуюся копию. Действие необратимо.')) return;
+  const btn = document.getElementById('merge-duplicates-btn');
+  btn.disabled = true; btn.textContent = 'Объединяю...';
+  try {
+    const d = await req('POST', '/api/admin/duplicate-photos/merge');
+    toast(`Объединено групп: ${d.merged_groups}, удалено лишних копий: ${d.removed_photos}`, 'ok');
+    checkDuplicatePhotos();
+    loadPhotos();
+    loadAdminStats();
+  } catch(e) {
+    toast(e.message || 'Ошибка', 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Объединить дубли';
+  }
+}
+
 async function deleteWatchUrl() {
   if (!confirm('Отключить авто-синхронизацию?')) return;
   try {
@@ -1218,6 +1416,150 @@ async function importYadisk() {
     fill.style.width = '0%';
     setTimeout(() => { progress.style.display = 'none'; importBtn.style.display = ''; }, 4000);
   }
+}
+
+// ── GOOGLE DRIVE IMPORT & AUTO-SYNC ─────────────────────────────────────────
+// Полный аналог блока Яндекс.Диска выше, только источник — публичная папка
+// Google Drive (доступ «у кого есть ссылка»). Подпапки сканируются
+// автоматически и сворачиваются в общий плоский список фото.
+
+async function previewGdrive() {
+  const url = document.getElementById('gdrive-url').value.trim();
+  if (!url) { toast('Введите ссылку на папку Google Диска', 'err'); return; }
+  const preview = document.getElementById('gdrive-preview');
+  const importBtn = document.getElementById('gdrive-import-btn');
+  preview.style.display = '';
+  preview.textContent = 'Загрузка списка файлов...';
+  importBtn.style.display = 'none';
+  try {
+    const data = await req('GET', '/api/admin/preview-gdrive?folder_url=' + encodeURIComponent(url));
+    if (data.total === 0) {
+      preview.textContent = 'Файлов не найдено. Проверьте ссылку и доступ к папке.';
+      return;
+    }
+    let html = `<div class="yadisk-summary">Найдено: ${data.total} фото, новых: <b>${data.new}</b></div>`;
+    html += '<div class="yadisk-file-list">';
+    data.files.forEach(f => {
+      const kb = Math.round(f.size / 1024);
+      const rowClass = f.exists ? 'exists' : 'new';
+      const status = f.exists ? 'уже есть' : 'новое';
+      html += `<div class="yadisk-file-row ${rowClass}">
+        <span class="yadisk-file-name">${f.name}</span>
+        <span class="yadisk-file-size">${kb} KB</span>
+        <span class="yadisk-file-status">${status}</span>
+      </div>`;
+    });
+    if (data.total > data.files.length) html += `<div class="yadisk-more">… и ещё ${data.total - data.files.length} файлов</div>`;
+    html += '</div>';
+    preview.innerHTML = html;
+    if (data.new > 0) importBtn.style.display = '';
+  } catch(e) {
+    preview.innerHTML = `<div class="yadisk-error">Ошибка: ${e.message || e}</div>`;
+    importBtn.style.display = 'none';
+  }
+}
+
+async function importGdrive() {
+  const url = document.getElementById('gdrive-url').value.trim();
+  if (!url) { toast('Введите ссылку на папку Google Диска', 'err'); return; }
+  const progress = document.getElementById('gdrive-progress');
+  const label = document.getElementById('gdrive-label');
+  const fill = document.getElementById('gdrive-fill');
+  const importBtn = document.getElementById('gdrive-import-btn');
+  importBtn.style.display = 'none';
+  progress.style.display = '';
+  label.textContent = 'Идёт импорт, подождите...';
+  fill.style.width = '100%';
+  try {
+    const fd = new FormData();
+    fd.append('folder_url', url);
+    const resp = await fetch(API + '/api/admin/import-gdrive', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token },
+      body: fd
+    });
+    const text = await resp.text();
+    let json; try { json = JSON.parse(text); } catch { json = text; }
+    if (!resp.ok) throw new Error(json?.detail || json || resp.statusText);
+    label.textContent = `Готово! Добавлено: ${json.added}, пропущено: ${json.skipped}, ошибок: ${json.errors}`;
+    fill.style.animation = 'none';
+    fill.style.width = '100%';
+    setTimeout(() => { progress.style.display = 'none'; }, 4000);
+    loadPhotos();
+  } catch(e) {
+    label.textContent = 'Ошибка: ' + (e.message || e);
+    fill.style.width = '0%';
+    setTimeout(() => { progress.style.display = 'none'; importBtn.style.display = ''; }, 4000);
+  }
+}
+
+async function loadGdriveWatchStatus() {
+  try {
+    const d = await req('GET', '/api/admin/gdrive-watch');
+    const status = document.getElementById('gdrive-watch-status');
+    const syncBtn = document.getElementById('gdrive-watch-sync-now-btn');
+    const delBtn = document.getElementById('gdrive-watch-delete-btn');
+    if (!d) {
+      status.innerHTML = '<span class="watch-off">⬤ Выключено</span>';
+      syncBtn.style.display = 'none';
+      delBtn.style.display = 'none';
+      return;
+    }
+    document.getElementById('gdrive-watch-url').value = d.folder_url || '';
+    const sel = document.getElementById('gdrive-watch-interval');
+    [...sel.options].forEach(o => { if (parseInt(o.value) === d.interval_minutes) o.selected = true; });
+    const lastSync = d.last_sync_at
+      ? new Date(d.last_sync_at + 'Z').toLocaleString('ru')
+      : 'ещё не было';
+    const added = d.last_sync_added ?? 0;
+    const errors = d.last_sync_errors ?? 0;
+    const nextSync = d.last_sync_at
+      ? new Date(new Date(d.last_sync_at + 'Z').getTime() + d.interval_minutes * 60000).toLocaleString('ru')
+      : 'скоро';
+    let syncInfo = added === -1
+      ? `<span class="watch-err">ошибка последней синхронизации</span>`
+      : `добавлено: <b>${added}</b>${errors ? `, ошибок: ${errors}` : ''}`;
+    status.innerHTML = `<span class="watch-on">⬤ Активно</span> · проверка каждые <b>${d.interval_minutes} мин</b><br>
+      <span class="watch-meta">Последняя: ${lastSync} (${syncInfo})</span><br>
+      <span class="watch-meta">Следующая: ${nextSync}</span>`;
+    syncBtn.style.display = '';
+    delBtn.style.display = '';
+  } catch(e) {
+    document.getElementById('gdrive-watch-status').textContent = '';
+  }
+}
+
+async function saveGdriveWatchUrl() {
+  const url = document.getElementById('gdrive-watch-url').value.trim();
+  if (!url) { toast('Введите ссылку', 'err'); return; }
+  const interval = document.getElementById('gdrive-watch-interval').value;
+  try {
+    await formReq('/api/admin/gdrive-watch', { folder_url: url, interval_minutes: interval });
+    toast('Авто-синхронизация включена! Первая проверка запущена.', 'ok');
+    loadGdriveWatchStatus();
+  } catch(e) { toast(e.message || 'Ошибка', 'err'); }
+}
+
+async function deleteGdriveWatchUrl() {
+  if (!confirm('Отключить авто-синхронизацию?')) return;
+  try {
+    await req('DELETE', '/api/admin/gdrive-watch');
+    toast('Авто-синхронизация отключена', 'ok');
+    document.getElementById('gdrive-watch-url').value = '';
+    loadGdriveWatchStatus();
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+async function gdriveWatchSyncNow() {
+  const btn = document.getElementById('gdrive-watch-sync-now-btn');
+  btn.disabled = true; btn.textContent = '↻ Проверяю...';
+  try {
+    const d = await req('POST', '/api/admin/gdrive-watch/sync-now');
+    toast(`Готово: добавлено ${d.added}, пропущено ${d.skipped}` + (d.errors ? `, ошибок ${d.errors}` : ''), 'ok');
+    loadGdriveWatchStatus();
+    if (d.added > 0) loadPhotos();
+  } catch(e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '↻ Проверить сейчас'; }
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────

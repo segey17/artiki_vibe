@@ -1,1 +1,5 @@
 photos/
+*.sqlite3
+data/*.sqlite3
+wd14_model/*.onnx
+wd14_model/*.csv

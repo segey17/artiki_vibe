@@ -6,6 +6,8 @@ services:
     volumes:
       - ./photos:/app/photos        # <-- кладите сюда свои 20к фото
       - ./data:/app/data            # SQLite БД
+      - ./wd14_model:/app/wd14_model  # <-- модель автотегирования (model.onnx + selected_tags.csv)
     environment:
       - JWT_SECRET=ЗАМЕНИТЕ_НА_СЛУЧАЙНУЮ_СТРОКУ_МИНИМУМ_32_СИМВОЛА
+      - GOOGLE_DRIVE_API_KEY=AIzaSyCYm1G9wW_2hSb8cRb0_7F0vAbeAKrZ7ws # нужен только для автосинхронизации с Google Drive
     restart: unless-stopped

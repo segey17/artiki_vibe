@@ -4,7 +4,18 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PhotoRank</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;700;900&family=Manrope:wght@300;400;500;600&display=swap">
+<script>
+  // Применяем сохранённую тему максимально рано, до первой отрисовки —
+  // иначе была бы видна вспышка светлой темы перед переключением на тёмную.
+  (function () {
+    try {
+      var saved = localStorage.getItem('theme');
+      var theme = saved || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.setAttribute('data-theme', theme);
+    } catch (e) {}
+  })();
+</script>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;700;800&family=Inter:wght@400;500;600;700;800&display=swap">
 <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
@@ -13,6 +24,7 @@
   <!-- AUTH -->
   <div id="screen-auth" class="screen active">
     <div class="auth-bg"></div>
+    <button class="nav-btn auth-theme-toggle theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
     <div class="auth-card">
       <div class="logo">PHOTO<span>RANK</span></div>
       <div class="auth-tabs">
@@ -40,6 +52,7 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <span id="nav-username"></span>
+        <button class="nav-btn theme-toggle-icon-target" id="theme-toggle-btn" onclick="toggleTheme()" title="Тема">🌙</button>
         <button class="nav-btn" onclick="showTierlist()" title="Тир-лист">🏆</button>
         <button class="nav-btn" onclick="showStats()" title="Статистика">📊</button>
         <button class="nav-btn" id="btn-admin-panel" onclick="showAdmin()" title="Админ" style="display:none">⚙️</button>
@@ -53,53 +66,57 @@
         <p class="sub">Администратор запустит голосование.</p>
       </div>
       <div id="vote-content">
-        <div class="photo-frame">
+        <div class="photo-frame" id="photo-frame">
           <img id="current-photo-img" src="" alt="">
-        </div>
-        <div class="vote-panel">
+          <div class="photo-error-hint" id="photo-error-hint" style="display:none">⚠️ Не удалось загрузить изображение</div>
           <div class="photo-name" id="photo-name"></div>
-          <div class="vote-progress">
-            <div class="progress-label">
-              <span>Проголосовали</span><span id="progress-fraction">0/0</span>
+        </div>
+        <div class="vote-right-col">
+          <div class="vote-panel">
+            <div class="vote-progress">
+              <div class="progress-label">
+                <span>Проголосовали</span>
+                <span id="progress-fraction">0/0</span>
+              </div>
+              <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
             </div>
-            <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
-          </div>
-          <div id="vote-stars-section">
-            <div class="stars-label">Ваша оценка</div>
-            <div class="tier-vote-btns" id="tier-vote-btns"></div>
-            <button class="btn-vote" id="btn-vote" disabled onclick="submitVote()">Выберите оценку</button>
-          </div>
-          <div id="vote-closed-msg" class="closed-msg" style="display:none">🔒 Голосование закрыто</div>
-          <div id="voted-badge" class="voted-badge" style="display:none">✅ <span id="voted-text"></span></div>
-
-          <div class="votes-list-wrap">
-            <button class="votes-toggle" onclick="toggleVotesList()" id="votes-toggle">
-              <span id="votes-toggle-label">Показать голоса ▾</span>
-            </button>
-            <div class="votes-list" id="votes-list" style="display:none"></div>
-          </div>
-
-          <div class="tags-wrap">
-            <div class="tags-label">Теги</div>
-            <div class="tags-selected" id="tags-selected"></div>
-            <div class="tags-search-wrap">
-              <input class="tags-input" id="tags-input" placeholder="Поиск тега..." oninput="searchTags(this.value)" onfocus="showDropdown()" autocomplete="off">
-              <div class="tags-dropdown" id="tags-dropdown" style="display:none"></div>
+            <div id="vote-stars-section">
+              <div class="stars-label">Ваша оценка</div>
+              <div class="tier-vote-btns" id="tier-vote-btns"></div>
+              <button class="btn-vote" id="btn-vote" disabled onclick="submitVote()">Выберите оценку</button>
             </div>
+            <div id="vote-closed-msg" class="closed-msg" style="display:none">🔒 Голосование закрыто</div>
+            <div id="voted-badge" class="voted-badge" style="display:none">✅ <span id="voted-text"></span></div>
+
+            <div class="votes-list-wrap">
+              <button class="votes-toggle" onclick="toggleVotesList()" id="votes-toggle">
+                <span id="votes-toggle-label">Показать голоса ▾</span>
+              </button>
+              <div class="votes-list" id="votes-list" style="display:none"></div>
+            </div>
+
+            <div class="tags-wrap">
+              <div class="tags-label">Теги</div>
+              <div class="tags-selected" id="tags-selected"></div>
+              <div class="tags-search-wrap">
+                <input class="tags-input" id="tags-input" placeholder="Поиск тега..." oninput="searchTags(this.value)" onfocus="showDropdown()" autocomplete="off">
+                <div class="tags-dropdown" id="tags-dropdown" style="display:none"></div>
+              </div>
+            </div>
+          </div>
+          <div id="admin-controls" class="admin-bar" style="display:none">
+            <div class="admin-bar-title">⚙️ Управление</div>
+            <div class="admin-bar-btns">
+              <button class="admin-btn" onclick="prevPhoto()" title="← или стрелка влево">← Назад</button>
+              <button class="admin-btn accent" onclick="nextPhoto()" title="→ или стрелка вправо">Вперёд →</button>
+              <button class="admin-btn" onclick="closeVoting()">🔒 Закрыть голос.</button>
+              <button class="admin-btn" onclick="shufflePhotos()" title="Перемешать все фото случайно">🔀 Перемешать</button>
+              <button class="admin-btn" id="auto-advance-btn" onclick="toggleAutoAdvance()" title="Авто-переход когда все онлайн проголосовали">⚡ Авто-переход</button>
+            </div>
+            <div class="admin-stats" id="admin-stats"></div>
+            <div id="online-users-bar" class="online-users-bar" style="display:none"></div>
           </div>
         </div>
-      </div>
-      <div id="admin-controls" class="admin-bar" style="display:none">
-        <div class="admin-bar-title">⚙️ Управление</div>
-        <div class="admin-bar-btns">
-          <button class="admin-btn" onclick="prevPhoto()" title="← или стрелка влево">← Назад</button>
-          <button class="admin-btn accent" onclick="nextPhoto()" title="→ или стрелка вправо">Вперёд →</button>
-          <button class="admin-btn" onclick="closeVoting()">🔒 Закрыть голос.</button>
-          <button class="admin-btn" onclick="shufflePhotos()" title="Перемешать все фото случайно">🔀 Перемешать</button>
-          <button class="admin-btn" id="auto-advance-btn" onclick="toggleAutoAdvance()" title="Авто-переход когда все онлайн проголосовали">⚡ Авто-переход</button>
-        </div>
-        <div class="admin-stats" id="admin-stats"></div>
-        <div id="online-users-bar" class="online-users-bar" style="display:none"></div>
       </div>
     </main>
   </div>
@@ -110,6 +127,7 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <button class="nav-btn" onclick="showVote()">← Назад</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
         <button class="nav-btn" onclick="logout()">⏻</button>
       </nav>
     </header>
@@ -154,6 +172,7 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <button class="nav-btn" onclick="showVote()">← Назад</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
         <button class="nav-btn" onclick="logout()">⏻</button>
       </nav>
     </header>
@@ -184,11 +203,18 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <button class="nav-btn" onclick="showVote()">← Назад</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
       </nav>
     </header>
     <main class="admin-main">
       <h1>Панель администратора</h1>
       <div class="admin-cards">
+
+        <div class="admin-card" id="wd14-status-card">
+          <h2>🏷️ Автотегирование (WD14)</h2>
+          <p class="hint">Локальная модель распознавания тегов. При загрузке/импорте каждое новое фото автоматически проверяется и помечается тегами.</p>
+          <div id="wd14-status-content">Проверка статуса…</div>
+        </div>
 
         <div class="admin-card">
           <h2>🏷️ Настройка тиров</h2>
@@ -204,6 +230,14 @@
           <h2>🗑️ Сброс базы данных</h2>
           <p class="hint">Удалит всех пользователей (кроме администраторов), все фотографии и оценки. Действие необратимо.</p>
           <button class="btn-danger" onclick="resetDB()">Полностью очистить БД</button>
+        </div>
+
+        <div class="admin-card">
+          <h2>🧹 Дубли фото</h2>
+          <p class="hint">Если авто-синхронизация запускалась параллельно сама с собой (например, фоновый таймер и ручная проверка совпали по времени), могли появиться задвоенные копии одного и того же фото. Голоса и теги при объединении переносятся на оставшуюся копию, а не теряются.</p>
+          <div id="duplicate-status" class="hint">Проверка...</div>
+          <button class="btn-secondary" onclick="checkDuplicatePhotos()">Проверить дубли</button>
+          <button class="btn-danger" id="merge-duplicates-btn" onclick="mergeDuplicatePhotos()" style="display:none">Объединить дубли</button>
         </div>
 
         <div class="admin-card">
@@ -241,6 +275,44 @@
             <button class="btn-primary" onclick="saveWatchUrl()">💾 Сохранить и включить</button>
             <button class="btn-secondary" id="watch-sync-now-btn" onclick="watchSyncNow()" style="display:none">↻ Проверить сейчас</button>
             <button class="btn-danger" id="watch-delete-btn" onclick="deleteWatchUrl()" style="display:none">✕ Отключить</button>
+          </div>
+        </div>
+
+        <div class="admin-card">
+          <h2>📁 Импорт с Google Диска</h2>
+          <p class="hint">Вставьте ссылку на публичную папку (доступ «у кого есть ссылка»). Подпапки внутри сканируются автоматически. Уже загруженные фото (по имени файла) будут пропущены.</p>
+          <div class="yadisk-input-row">
+            <input type="text" id="gdrive-url" placeholder="https://drive.google.com/drive/folders/..." class="yadisk-input">
+            <button class="btn-secondary" onclick="previewGdrive()">Проверить</button>
+          </div>
+          <div id="gdrive-preview" class="yadisk-preview" style="display:none"></div>
+          <button class="btn-primary mt" id="gdrive-import-btn" onclick="importGdrive()" style="display:none">
+            Импортировать
+          </button>
+          <div class="upload-progress" id="gdrive-progress" style="display:none">
+            <div class="up-bar"><div class="up-fill" id="gdrive-fill" style="width:100%;animation:pulse 1.5s infinite"></div></div>
+            <div class="up-label" id="gdrive-label">Идёт импорт, подождите...</div>
+          </div>
+        </div>
+
+        <div class="admin-card">
+          <h2>🔄 Авто-синхронизация с Google Диском</h2>
+          <p class="hint">Сервис будет автоматически проверять папку (включая подпапки) и загружать новые фото без участия администратора.</p>
+          <div id="gdrive-watch-status" class="watch-status"></div>
+          <div class="yadisk-input-row">
+            <input type="text" id="gdrive-watch-url" placeholder="https://drive.google.com/drive/folders/..." class="yadisk-input">
+            <select id="gdrive-watch-interval" class="watch-interval-select">
+              <option value="15">каждые 15 мин</option>
+              <option value="30">каждые 30 мин</option>
+              <option value="60" selected>каждый час</option>
+              <option value="180">каждые 3 часа</option>
+              <option value="360">каждые 6 часов</option>
+            </select>
+          </div>
+          <div class="watch-btns">
+            <button class="btn-primary" onclick="saveGdriveWatchUrl()">💾 Сохранить и включить</button>
+            <button class="btn-secondary" id="gdrive-watch-sync-now-btn" onclick="gdriveWatchSyncNow()" style="display:none">↻ Проверить сейчас</button>
+            <button class="btn-danger" id="gdrive-watch-delete-btn" onclick="deleteGdriveWatchUrl()" style="display:none">✕ Отключить</button>
           </div>
         </div>
 

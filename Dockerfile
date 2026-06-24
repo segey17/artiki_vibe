@@ -10,7 +10,9 @@ COPY frontend/ ./frontend/
 COPY create_admin.py .
 COPY tags.csv .
 
-RUN mv backend/main.py .
+RUN mv backend/main.py . && \
+    mv backend/wd14_tagger.py . && \
+    mkdir -p ./wd14_model
 
 EXPOSE 8000
 

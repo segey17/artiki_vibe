@@ -8,6 +8,7 @@ import sqlite3, os, jwt, bcrypt, uuid, io, json, asyncio, httpx, re
 from datetime import datetime, timedelta
 from typing import Optional
 from PIL import Image as PILImage
+import wd14_tagger
 
 try:
     from pillow_heif import register_heif_opener
@@ -15,15 +16,27 @@ try:
 except ImportError:
     pass
 
+# Защита от гонки: ручной "Проверить сейчас"/повторное сохранение настройки
+# и фоновый таймер могут попытаться синхронизировать один и тот же источник
+# одновременно. Без блокировки оба параллельных запуска читают один и тот же
+# "снимок" уже загруженных файлов, не видят файлы, которые другой запуск
+# только начал скачивать, и оба независимо загружают одно и то же — отсюда
+# дубли в БД. Lock гарантирует, что для каждого источника в любой момент
+# выполняется не больше одной синхронизации.
+yadisk_sync_lock = asyncio.Lock()
+gdrive_sync_lock = asyncio.Lock()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(yadisk_sync_loop())
+    yadisk_task = asyncio.create_task(yadisk_sync_loop())
+    gdrive_task = asyncio.create_task(gdrive_sync_loop())
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    for task in (yadisk_task, gdrive_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 app = FastAPI(title="PhotoRank", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
@@ -79,6 +92,8 @@ async def websocket_endpoint(ws: WebSocket, token: Optional[str] = None):
 SECRET = os.getenv("JWT_SECRET", "change-me-in-production-please")
 PHOTOS_DIR = "/app/photos"
 DB_PATH = "/app/data/db.sqlite3"
+AUTO_TAGGER_USERNAME = "auto-tagger"  # системный "пользователь", от имени которого пишутся автотеги
+GOOGLE_DRIVE_API_KEY = os.getenv("GOOGLE_DRIVE_API_KEY", "")  # для доступа к публичным папкам Google Drive
 os.makedirs(PHOTOS_DIR, exist_ok=True)
 os.makedirs("/app/data", exist_ok=True)
 
@@ -106,6 +121,7 @@ def init_db():
         username TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
         is_admin INTEGER DEFAULT 0,
+        is_system INTEGER DEFAULT 0,
         created_at TEXT DEFAULT (datetime('now'))
     );
     CREATE TABLE IF NOT EXISTS photos (
@@ -155,6 +171,15 @@ def init_db():
         last_sync_errors INTEGER DEFAULT 0,
         enabled INTEGER DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS gdrive_watch (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        folder_url TEXT NOT NULL,
+        interval_minutes INTEGER DEFAULT 60,
+        last_sync_at TEXT,
+        last_sync_added INTEGER DEFAULT 0,
+        last_sync_errors INTEGER DEFAULT 0,
+        enabled INTEGER DEFAULT 1
+    );
     """)
     cols = [r[1] for r in db.execute("PRAGMA table_info(ratings)").fetchall()]
     if 'score' in cols and 'tier_id' not in cols:
@@ -173,6 +198,27 @@ def init_db():
                          for r in reader if r['name'] and r['category'] in ('0','4','9')]
             db.executemany("INSERT OR IGNORE INTO tags (id,name,category) VALUES (?,?,?)", batch)
             print(f"Loaded {len(batch)} tags")
+    user_cols = [r[1] for r in db.execute("PRAGMA table_info(users)").fetchall()]
+    if 'is_system' not in user_cols:
+        db.execute("ALTER TABLE users ADD COLUMN is_system INTEGER DEFAULT 0")
+    photo_tags_cols = [r[1] for r in db.execute("PRAGMA table_info(photo_tags)").fetchall()]
+    if 'is_suggestion' not in photo_tags_cols:
+        # 0 = обычный тег (виден везде: тир-лист, фильтры, счётчики).
+        # 1 = предложение от автотегирования WD14, ожидающее подтверждения
+        #     хотя бы одним человеком — до этого момента не учитывается
+        #     ни в тир-листе, ни в фильтрах по тегам, ни в счётчиках "сколько
+        #     пользователей поставили тег".
+        db.execute("ALTER TABLE photo_tags ADD COLUMN is_suggestion INTEGER DEFAULT 0")
+    # Системный пользователь, от имени которого пишутся автотеги WD14.
+    # is_system=1 — исключается из всех счётчиков "обычных" людей
+    # (прогресс-бар голосования, список участников статистики и т.п.).
+    # Пароль — случайный недостижимый хэш, под этим юзером никто не логинится.
+    if not db.execute("SELECT id FROM users WHERE username=?", (AUTO_TAGGER_USERNAME,)).fetchone():
+        random_pw_hash = bcrypt.hashpw(str(uuid.uuid4()).encode(), bcrypt.gensalt()).decode()
+        db.execute(
+            "INSERT INTO users (username, password_hash, is_admin, is_system) VALUES (?,?,0,1)",
+            (AUTO_TAGGER_USERNAME, random_pw_hash)
+        )
     db.commit()
     db.close()
 
@@ -210,6 +256,71 @@ def get_tiers(db):
         if t: return sorted(t, key=lambda x: x.get("order", 0))
     except: pass
     return DEFAULT_TIERS[:]
+
+_auto_tagger_user_id_cache = None
+
+def _get_auto_tagger_user_id(db) -> Optional[int]:
+    global _auto_tagger_user_id_cache
+    if _auto_tagger_user_id_cache is None:
+        row = db.execute("SELECT id FROM users WHERE username=?", (AUTO_TAGGER_USERNAME,)).fetchone()
+        if not row:
+            return None
+        _auto_tagger_user_id_cache = row["id"]
+    return _auto_tagger_user_id_cache
+
+def auto_tag_photo(photo_id: int, photo_path: str):
+    """
+    Прогоняет фото через локальную WD14-модель и записывает найденные теги
+    как ПРЕДЛОЖЕНИЯ (is_suggestion=1) от имени системного пользователя
+    auto-tagger — они не считаются "настоящими" тегами фото (не учитываются
+    в тир-листе, фильтрах по тегам, счётчиках), пока их не подтвердит хотя бы
+    один реальный человек через confirm_suggested_tag().
+
+    Вызывается синхронно сразу после сохранения нового фото на диск (upload,
+    импорт с Яндекс.Диска, авто-синхронизация) — все три точки вызова сами
+    оборачивают это в try/except, так что любая ошибка здесь (модель не
+    скачана, файл повреждён и т.п.) не мешает самой загрузке фото.
+    """
+    tag_ids = wd14_tagger.predict_tag_ids(photo_path)
+    if not tag_ids:
+        return
+
+    db = get_db()
+    try:
+        tagger_id = _get_auto_tagger_user_id(db)
+        if tagger_id is None:
+            return
+        # Берём только те tag_id, что реально есть в нашей таблице tags —
+        # на случай несовпадения версий selected_tags.csv модели и tags.csv проекта.
+        existing = set(
+            r["id"] for r in db.execute(
+                "SELECT id FROM tags WHERE id IN ({})".format(",".join("?" * len(tag_ids))),
+                tag_ids
+            ).fetchall()
+        )
+        rows = [(photo_id, tagger_id, tid) for tid in tag_ids if tid in existing]
+        if rows:
+            db.executemany(
+                "INSERT OR IGNORE INTO photo_tags (photo_id, user_id, tag_id, is_suggestion) VALUES (?,?,?,1)",
+                rows
+            )
+            db.commit()
+    finally:
+        db.close()
+
+async def auto_tag_photo_async(photo_id: int, photo_path: str):
+    """
+    Асинхронная обёртка над auto_tag_photo(): инференс WD14 — это блокирующая
+    CPU-bound операция, поэтому выполняем её в отдельном треде через
+    run_in_executor, чтобы не подвешивать event loop FastAPI (другие запросы,
+    WebSocket и т.п.) на время распознавания тегов.
+    Любая ошибка здесь гасится — тегирование не должно прерывать загрузку фото.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, auto_tag_photo, photo_id, photo_path)
+    except Exception as e:
+        print(f"[auto_tag_photo_async] Пропускаем автотегирование фото {photo_id}: {e}")
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 
@@ -327,6 +438,88 @@ async def yadisk_download_file(public_url: str, path: str) -> bytes:
         return resp.content
 
 
+# ── GOOGLE DRIVE ──────────────────────────────────────────────────────────────
+# Доступ к публичной папке ("у кого есть ссылка") через Google Drive API v3
+# и обычный API-ключ — без OAuth, без входа пользователя, без истекающих
+# токенов. Подходит только для папок, открытых на чтение всем по ссылке.
+
+GDRIVE_API = "https://www.googleapis.com/drive/v3/files"
+GDRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
+
+def gdrive_extract_folder_id(url: str) -> str:
+    """
+    Принимает ссылку вида https://drive.google.com/drive/folders/<ID>?usp=sharing
+    (или просто сам <ID>) и возвращает folder_id.
+    """
+    url = url.strip()
+    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    # на случай, если просто вставили сам ID без ссылки
+    if re.fullmatch(r"[a-zA-Z0-9_-]{10,}", url):
+        return url
+    raise HTTPException(400, "Не удалось распознать ID папки Google Drive в ссылке")
+
+async def gdrive_list_files(folder_url: str) -> list:
+    """
+    Рекурсивно собирает все изображения из публичной папки Google Drive
+    (включая вложенные подпапки, без сохранения структуры — плоский список,
+    как договорились). Требует GOOGLE_DRIVE_API_KEY и доступ "у кого есть
+    ссылка" на папку и все вложенные подпапки/файлы.
+    """
+    if not GOOGLE_DRIVE_API_KEY:
+        raise HTTPException(500, "GOOGLE_DRIVE_API_KEY не задан в переменных окружения сервера")
+
+    root_id = gdrive_extract_folder_id(folder_url)
+    files = []
+
+    async def walk(folder_id: str):
+        page_token = None
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                params = {
+                    "q": f"'{folder_id}' in parents and trashed=false",
+                    "key": GOOGLE_DRIVE_API_KEY,
+                    "fields": "nextPageToken, files(id,name,mimeType,size)",
+                    "pageSize": 1000,
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                r = await client.get(GDRIVE_API, params=params)
+                if r.status_code != 200:
+                    raise HTTPException(
+                        502, f"Google Drive API вернул {r.status_code}: {r.text[:200]}"
+                    )
+                data = r.json()
+                for item in data.get("files", []):
+                    if item["mimeType"] == GDRIVE_FOLDER_MIME:
+                        await walk(item["id"])
+                    elif item["mimeType"].startswith("image/"):
+                        files.append({
+                            "id": item["id"],
+                            "name": item["name"],
+                            "size": int(item.get("size", 0) or 0),
+                        })
+                page_token = data.get("nextPageToken")
+                if not page_token:
+                    break
+
+    await walk(root_id)
+    return files
+
+async def gdrive_download_file(file_id: str) -> bytes:
+    """Скачивает содержимое файла по его id через alt=media."""
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.get(
+            f"{GDRIVE_API}/{file_id}",
+            params={"key": GOOGLE_DRIVE_API_KEY, "alt": "media"},
+            follow_redirects=True,
+        )
+        if r.status_code != 200:
+            raise Exception(f"Не удалось скачать файл {file_id}: {r.status_code}")
+        return r.content
+
+
 @app.post("/api/admin/import-yadisk")
 async def import_yadisk(public_url: str = Form(...), user=Depends(admin_user)):
     """
@@ -351,6 +544,7 @@ async def import_yadisk(public_url: str = Form(...), user=Depends(admin_user)):
 
     added = 0
     errors = 0
+    new_photos = []  # (photo_id, full_path) — для автотегирования после вставки
     for file_info in new_files:
         try:
             data = await yadisk_download_file(public_url, file_info["path"])
@@ -361,17 +555,24 @@ async def import_yadisk(public_url: str = Form(...), user=Depends(admin_user)):
             path = os.path.join(PHOTOS_DIR, filename)
             img.convert("RGB").save(path, "JPEG", quality=92)
             count = db.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
-            db.execute(
+            cur = db.execute(
                 "INSERT INTO photos (filename, original_name, position) VALUES (?,?,?)",
                 (filename, file_info["name"], count)
             )
             db.commit()
+            new_photos.append((cur.lastrowid, path))
             added += 1
         except Exception:
             errors += 1
             continue
 
     db.close()
+
+    # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
+    # фото всё равно уже импортированы выше.
+    for photo_id, path in new_photos:
+        await auto_tag_photo_async(photo_id, path)
+
     return {
         "total_found": len(all_files),
         "skipped": len(all_files) - len(new_files),
@@ -404,56 +605,70 @@ async def preview_yadisk(public_url: str, user=Depends(admin_user)):
 
 async def yadisk_sync_once() -> dict:
     """Синхронизирует фото из сохранённой ссылки. Возвращает статистику."""
-    db = get_db()
-    row = db.execute("SELECT public_url FROM yadisk_watch WHERE id=1 AND enabled=1").fetchone()
-    if not row:
-        db.close()
-        return {"added": 0, "errors": 0, "skipped": 0}
-    public_url = row["public_url"]
-    existing_names = {r["original_name"] for r in
-                      db.execute("SELECT original_name FROM photos").fetchall()}
-    db.close()
+    if yadisk_sync_lock.locked():
+        # Синхронизация уже идёт в другом вызове (например, фоновый таймер
+        # и ручное "Проверить сейчас" совпали по времени) — не запускаем
+        # вторую параллельно, просто сообщаем, что она уже выполняется.
+        return {"added": 0, "errors": 0, "skipped": 0, "already_running": True}
 
-    try:
-        all_files = await yadisk_list_files(public_url)
-    except Exception as e:
+    async with yadisk_sync_lock:
+        db = get_db()
+        row = db.execute("SELECT public_url FROM yadisk_watch WHERE id=1 AND enabled=1").fetchone()
+        if not row:
+            db.close()
+            return {"added": 0, "errors": 0, "skipped": 0}
+        public_url = row["public_url"]
+        existing_names = {r["original_name"] for r in
+                          db.execute("SELECT original_name FROM photos").fetchall()}
+        db.close()
+
+        try:
+            all_files = await yadisk_list_files(public_url)
+        except Exception as e:
+            db = get_db()
+            db.execute(
+                "UPDATE yadisk_watch SET last_sync_at=?, last_sync_added=0, last_sync_errors=-1 WHERE id=1",
+                (datetime.utcnow().isoformat(),)
+            )
+            db.commit(); db.close()
+            return {"added": 0, "errors": -1, "error_msg": str(e)}
+
+        new_files = [f for f in all_files if f["name"] not in existing_names]
+        added = errors = 0
+        new_photos = []  # (photo_id, full_path) — для автотегирования после вставки
+        for file_info in new_files:
+            try:
+                data = await yadisk_download_file(public_url, file_info["path"])
+                img = PILImage.open(io.BytesIO(data)); img.load()
+                uid = str(uuid.uuid4()); filename = uid + ".jpg"
+                path = os.path.join(PHOTOS_DIR, filename)
+                img.convert("RGB").save(path, "JPEG", quality=92)
+                db = get_db()
+                count = db.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+                cur = db.execute("INSERT INTO photos (filename, original_name, position) VALUES (?,?,?)",
+                           (filename, file_info["name"], count))
+                db.commit(); db.close()
+                new_photos.append((cur.lastrowid, path))
+                added += 1
+            except Exception:
+                errors += 1
+
         db = get_db()
         db.execute(
-            "UPDATE yadisk_watch SET last_sync_at=?, last_sync_added=0, last_sync_errors=-1 WHERE id=1",
-            (datetime.utcnow().isoformat(),)
+            "UPDATE yadisk_watch SET last_sync_at=?, last_sync_added=?, last_sync_errors=? WHERE id=1",
+            (datetime.utcnow().isoformat(), added, errors)
         )
         db.commit(); db.close()
-        return {"added": 0, "errors": -1, "error_msg": str(e)}
 
-    new_files = [f for f in all_files if f["name"] not in existing_names]
-    added = errors = 0
-    for file_info in new_files:
-        try:
-            data = await yadisk_download_file(public_url, file_info["path"])
-            img = PILImage.open(io.BytesIO(data)); img.load()
-            uid = str(uuid.uuid4()); filename = uid + ".jpg"
-            path = os.path.join(PHOTOS_DIR, filename)
-            img.convert("RGB").save(path, "JPEG", quality=92)
-            db = get_db()
-            count = db.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
-            db.execute("INSERT INTO photos (filename, original_name, position) VALUES (?,?,?)",
-                       (filename, file_info["name"], count))
-            db.commit(); db.close()
-            added += 1
-        except Exception:
-            errors += 1
+        # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
+        # фото всё равно уже синхронизированы выше.
+        for photo_id, path in new_photos:
+            await auto_tag_photo_async(photo_id, path)
 
-    db = get_db()
-    db.execute(
-        "UPDATE yadisk_watch SET last_sync_at=?, last_sync_added=?, last_sync_errors=? WHERE id=1",
-        (datetime.utcnow().isoformat(), added, errors)
-    )
-    db.commit(); db.close()
+        if added > 0:
+            await ws_manager.broadcast({"type": "photos_updated", "added": added})
 
-    if added > 0:
-        await ws_manager.broadcast({"type": "photos_updated", "added": added})
-
-    return {"added": added, "errors": errors, "skipped": len(all_files) - len(new_files)}
+        return {"added": added, "errors": errors, "skipped": len(all_files) - len(new_files)}
 
 
 async def yadisk_sync_loop():
@@ -526,23 +741,258 @@ async def yadisk_watch_sync_now(user=Depends(admin_user)):
     return result
 
 
+# ── GOOGLE DRIVE: IMPORT & AUTO-SYNC ──────────────────────────────────────────
+# Полный аналог блока Яндекс.Диска выше, только источник — публичная папка
+# Google Drive (доступ "у кого есть ссылка"). Подпапки сворачиваются в общий
+# плоский список — без сохранения структуры, как и договаривались.
+
+@app.post("/api/admin/import-gdrive")
+async def import_gdrive(folder_url: str = Form(...), user=Depends(admin_user)):
+    """
+    Сканирует публичную папку Google Drive (включая подпапки) и импортирует
+    все изображения. Уже существующие файлы (по имени) пропускаются.
+    """
+    db = get_db()
+    existing_names = {r["original_name"] for r in
+                      db.execute("SELECT original_name FROM photos").fetchall()}
+
+    try:
+        all_files = await gdrive_list_files(folder_url)
+    except HTTPException:
+        db.close()
+        raise
+    except Exception as e:
+        db.close()
+        raise HTTPException(502, f"Ошибка получения списка файлов: {e}")
+
+    new_files = [f for f in all_files if f["name"] not in existing_names]
+
+    added = 0
+    errors = 0
+    new_photos = []  # (photo_id, full_path) — для автотегирования после вставки
+    for file_info in new_files:
+        try:
+            data = await gdrive_download_file(file_info["id"])
+            img = PILImage.open(io.BytesIO(data))
+            img.load()
+            uid = str(uuid.uuid4())
+            filename = uid + ".jpg"
+            path = os.path.join(PHOTOS_DIR, filename)
+            img.convert("RGB").save(path, "JPEG", quality=92)
+            count = db.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+            cur = db.execute(
+                "INSERT INTO photos (filename, original_name, position) VALUES (?,?,?)",
+                (filename, file_info["name"], count)
+            )
+            db.commit()
+            new_photos.append((cur.lastrowid, path))
+            added += 1
+        except Exception:
+            errors += 1
+            continue
+
+    db.close()
+
+    # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
+    # фото всё равно уже импортированы выше.
+    for photo_id, path in new_photos:
+        await auto_tag_photo_async(photo_id, path)
+
+    return {
+        "total_found": len(all_files),
+        "skipped": len(all_files) - len(new_files),
+        "added": added,
+        "errors": errors,
+    }
+
+
+@app.get("/api/admin/preview-gdrive")
+async def preview_gdrive(folder_url: str, user=Depends(admin_user)):
+    """Возвращает список файлов в папке без скачивания."""
+    try:
+        files = await gdrive_list_files(folder_url)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+    db = get_db()
+    existing = {r["original_name"] for r in
+                db.execute("SELECT original_name FROM photos").fetchall()}
+    db.close()
+
+    return {
+        "total": len(files),
+        "new": len([f for f in files if f["name"] not in existing]),
+        "files": [{"name": f["name"], "size": f["size"],
+                   "exists": f["name"] in existing} for f in files[:50]],
+    }
+
+
+async def gdrive_sync_once() -> dict:
+    """Синхронизирует фото из сохранённой ссылки на папку Google Drive."""
+    if gdrive_sync_lock.locked():
+        # Синхронизация уже идёт в другом вызове (например, фоновый таймер
+        # и ручное "Проверить сейчас" совпали по времени) — не запускаем
+        # вторую параллельно, просто сообщаем, что она уже выполняется.
+        return {"added": 0, "errors": 0, "skipped": 0, "already_running": True}
+
+    async with gdrive_sync_lock:
+        db = get_db()
+        row = db.execute("SELECT folder_url FROM gdrive_watch WHERE id=1 AND enabled=1").fetchone()
+        if not row:
+            db.close()
+            return {"added": 0, "errors": 0, "skipped": 0}
+        folder_url = row["folder_url"]
+        existing_names = {r["original_name"] for r in
+                          db.execute("SELECT original_name FROM photos").fetchall()}
+        db.close()
+
+        try:
+            all_files = await gdrive_list_files(folder_url)
+        except Exception as e:
+            db = get_db()
+            db.execute(
+                "UPDATE gdrive_watch SET last_sync_at=?, last_sync_added=0, last_sync_errors=-1 WHERE id=1",
+                (datetime.utcnow().isoformat(),)
+            )
+            db.commit(); db.close()
+            return {"added": 0, "errors": -1, "error_msg": str(e)}
+
+        new_files = [f for f in all_files if f["name"] not in existing_names]
+        added = errors = 0
+        new_photos = []  # (photo_id, full_path) — для автотегирования после вставки
+        for file_info in new_files:
+            try:
+                data = await gdrive_download_file(file_info["id"])
+                img = PILImage.open(io.BytesIO(data)); img.load()
+                uid = str(uuid.uuid4()); filename = uid + ".jpg"
+                path = os.path.join(PHOTOS_DIR, filename)
+                img.convert("RGB").save(path, "JPEG", quality=92)
+                db = get_db()
+                count = db.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+                cur = db.execute("INSERT INTO photos (filename, original_name, position) VALUES (?,?,?)",
+                           (filename, file_info["name"], count))
+                db.commit(); db.close()
+                new_photos.append((cur.lastrowid, path))
+                added += 1
+            except Exception:
+                errors += 1
+
+        db = get_db()
+        db.execute(
+            "UPDATE gdrive_watch SET last_sync_at=?, last_sync_added=?, last_sync_errors=? WHERE id=1",
+            (datetime.utcnow().isoformat(), added, errors)
+        )
+        db.commit(); db.close()
+
+        # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
+        # фото всё равно уже синхронизированы выше.
+        for photo_id, path in new_photos:
+            await auto_tag_photo_async(photo_id, path)
+
+        if added > 0:
+            await ws_manager.broadcast({"type": "photos_updated", "added": added})
+
+        return {"added": added, "errors": errors, "skipped": len(all_files) - len(new_files)}
+
+
+async def gdrive_sync_loop():
+    """Фоновая задача: проверяет Google Drive с заданным интервалом."""
+    while True:
+        try:
+            db = get_db()
+            row = db.execute(
+                "SELECT interval_minutes, last_sync_at FROM gdrive_watch WHERE id=1 AND enabled=1"
+            ).fetchone()
+            db.close()
+            if row:
+                interval = (row["interval_minutes"] or 60) * 60
+                last = row["last_sync_at"]
+                if last:
+                    elapsed = (datetime.utcnow() - datetime.fromisoformat(last)).total_seconds()
+                    wait = max(0, interval - elapsed)
+                else:
+                    wait = 0
+                if wait > 0:
+                    await asyncio.sleep(min(wait, 60))
+                    continue
+                await gdrive_sync_once()
+            else:
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(60)
+
+
+@app.get("/api/admin/gdrive-watch")
+def get_gdrive_watch(user=Depends(admin_user)):
+    db = get_db()
+    row = db.execute("SELECT * FROM gdrive_watch WHERE id=1").fetchone()
+    db.close()
+    return dict(row) if row else None
+
+
+@app.post("/api/admin/gdrive-watch")
+async def set_gdrive_watch(
+    folder_url: str = Form(...),
+    interval_minutes: int = Form(60),
+    user=Depends(admin_user)
+):
+    db = get_db()
+    db.execute(
+        "INSERT INTO gdrive_watch (id, folder_url, interval_minutes, enabled) VALUES (1,?,?,1) "
+        "ON CONFLICT(id) DO UPDATE SET folder_url=excluded.folder_url, "
+        "interval_minutes=excluded.interval_minutes, enabled=1, last_sync_at=NULL",
+        (folder_url.strip(), max(5, interval_minutes))
+    )
+    db.commit(); db.close()
+    # Запустить немедленную синхронизацию в фоне
+    asyncio.create_task(gdrive_sync_once())
+    return {"status": "ok"}
+
+
+@app.delete("/api/admin/gdrive-watch")
+def delete_gdrive_watch(user=Depends(admin_user)):
+    db = get_db()
+    db.execute("DELETE FROM gdrive_watch WHERE id=1")
+    db.commit(); db.close()
+    return {"status": "ok"}
+
+
+@app.post("/api/admin/gdrive-watch/sync-now")
+async def gdrive_watch_sync_now(user=Depends(admin_user)):
+    result = await gdrive_sync_once()
+    return result
+
+
 # ── PHOTOS ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/admin/photos/upload")
 async def upload_photos(files: list[UploadFile] = File(...), user=Depends(admin_user)):
     db = get_db(); added = 0
+    new_photos = []  # (photo_id, full_path) — для автотегирования после вставки
     for f in files:
         data = await f.read()
         try:
             img = PILImage.open(io.BytesIO(data)); img.load()
         except: continue
         uid = str(uuid.uuid4()); filename = uid + ".jpg"
-        img.convert("RGB").save(os.path.join(PHOTOS_DIR, filename), "JPEG", quality=92)
+        path = os.path.join(PHOTOS_DIR, filename)
+        img.convert("RGB").save(path, "JPEG", quality=92)
         count = db.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
-        db.execute("INSERT INTO photos (filename,original_name,position) VALUES (?,?,?)",
+        cur = db.execute("INSERT INTO photos (filename,original_name,position) VALUES (?,?,?)",
                    (filename, f.filename, count))
+        new_photos.append((cur.lastrowid, path))
         added += 1
     db.commit(); db.close()
+
+    # Автотегирование WD14 — по договорённости: при ошибке/недоступности модели
+    # просто пропускаем, фото всё равно уже загружено выше.
+    for photo_id, path in new_photos:
+        await auto_tag_photo_async(photo_id, path)
+
     return {"added": added}
 
 @app.get("/api/admin/photos")
@@ -564,8 +1014,77 @@ def delete_photo(pid: int, user=Depends(admin_user)):
         except: pass
         db.execute("DELETE FROM photos WHERE id=?", (pid,))
         db.execute("DELETE FROM ratings WHERE photo_id=?", (pid,))
+        db.execute("DELETE FROM photo_tags WHERE photo_id=?", (pid,))
         db.commit()
     db.close(); return {"ok": True}
+
+@app.get("/api/admin/duplicate-photos")
+def find_duplicate_photos(user=Depends(admin_user)):
+    """
+    Находит фото с одинаковым original_name — обычно следствие гонки при
+    параллельном запуске синхронизации (см. merge_duplicate_photos). Не
+    удаляет ничего сама, только показывает, что будет затронуто.
+    """
+    db = get_db()
+    groups = db.execute("""
+        SELECT original_name, GROUP_CONCAT(id) as ids, COUNT(*) as cnt
+        FROM photos GROUP BY original_name HAVING cnt > 1
+        ORDER BY cnt DESC
+    """).fetchall()
+    db.close()
+    return {
+        "groups": len(groups),
+        "extra_photos": sum(g["cnt"] - 1 for g in groups),
+        "details": [{"original_name": g["original_name"], "ids": g["ids"], "count": g["cnt"]} for g in groups],
+    }
+
+@app.post("/api/admin/duplicate-photos/merge")
+def merge_duplicate_photos(user=Depends(admin_user)):
+    """
+    Объединяет дубли (фото с одинаковым original_name, обычно из-за гонки
+    при параллельном запуске авто-синхронизации до того, как в коде
+    появилась защита через Lock). Для каждой группы дублей оставляет самую
+    раннюю запись (минимальный id), а голоса и теги с удаляемых копий
+    переносит на неё — не теряет, если разные люди успели проголосовать
+    на разных копиях одного и того же фото. Файлы лишних копий удаляются с диска.
+    """
+    db = get_db()
+    groups = db.execute("""
+        SELECT original_name, GROUP_CONCAT(id) as ids
+        FROM photos GROUP BY original_name HAVING COUNT(*) > 1
+    """).fetchall()
+
+    merged_groups = 0
+    removed_photos = 0
+    for g in groups:
+        ids = sorted(int(x) for x in g["ids"].split(","))
+        keep_id = ids[0]
+        remove_ids = ids[1:]
+
+        for rid in remove_ids:
+            # переносим голоса и теги, которых ещё нет у keep_id (не теряем чужие оценки)
+            for r in db.execute("SELECT user_id, tier_id FROM ratings WHERE photo_id=?", (rid,)).fetchall():
+                db.execute("INSERT OR IGNORE INTO ratings (photo_id, user_id, tier_id) VALUES (?,?,?)",
+                           (keep_id, r["user_id"], r["tier_id"]))
+            for t in db.execute("SELECT user_id, tag_id, is_suggestion FROM photo_tags WHERE photo_id=?", (rid,)).fetchall():
+                db.execute("INSERT OR IGNORE INTO photo_tags (photo_id, user_id, tag_id, is_suggestion) VALUES (?,?,?,?)",
+                           (keep_id, t["user_id"], t["tag_id"], t["is_suggestion"]))
+
+            row = db.execute("SELECT filename FROM photos WHERE id=?", (rid,)).fetchone()
+            if row:
+                try: os.remove(os.path.join(PHOTOS_DIR, row["filename"]))
+                except: pass
+
+            db.execute("DELETE FROM ratings WHERE photo_id=?", (rid,))
+            db.execute("DELETE FROM photo_tags WHERE photo_id=?", (rid,))
+            db.execute("DELETE FROM photos WHERE id=?", (rid,))
+            removed_photos += 1
+
+        merged_groups += 1
+
+    db.commit()
+    db.close()
+    return {"merged_groups": merged_groups, "removed_photos": removed_photos}
 
 # ── VOTING ────────────────────────────────────────────────────────────────────
 
@@ -590,8 +1109,17 @@ def current_photo(user=Depends(current_user)):
     tier_counts = {}
     for r in db.execute("SELECT tier_id, COUNT(*) as cnt FROM ratings WHERE photo_id=? GROUP BY tier_id", (photo_id,)).fetchall():
         tier_counts[r["tier_id"]] = r["cnt"]
-    total_users = db.execute("SELECT COUNT(*) FROM users WHERE is_admin=0").fetchone()[0]
+    total_users = db.execute("SELECT COUNT(*) FROM users WHERE is_admin=0 AND is_system=0").fetchone()[0]
     auto_advance = get_setting(db, "auto_advance") == "1"
+
+    # ── следующее/предыдущее фото (для предзагрузки в кэш на фронтенде) ───────
+    next_row = db.execute(
+        "SELECT filename FROM photos WHERE position>(SELECT position FROM photos WHERE id=?) ORDER BY position LIMIT 1",
+        (photo_id,)).fetchone()
+    prev_row = db.execute(
+        "SELECT filename FROM photos WHERE position<(SELECT position FROM photos WHERE id=?) ORDER BY position DESC LIMIT 1",
+        (photo_id,)).fetchone()
+
     db.close()
     return {
         "photo": dict(row) if row else None,
@@ -601,6 +1129,8 @@ def current_photo(user=Depends(current_user)):
         "tiers": tiers,
         "tier_counts": tier_counts,
         "auto_advance": auto_advance,
+        "next_filename": next_row["filename"] if next_row else None,
+        "prev_filename": prev_row["filename"] if prev_row else None,
     }
 
 @app.post("/api/rate")
@@ -627,7 +1157,7 @@ async def rate_photo(photo_id: int = Form(...), tier_id: str = Form(...), user=D
         # Только не-админы считаются «участниками»
         non_admin_online = set(
             r["id"] for r in db.execute(
-                "SELECT id FROM users WHERE is_admin=0 AND id IN ({})".format(
+                "SELECT id FROM users WHERE is_admin=0 AND is_system=0 AND id IN ({})".format(
                     ",".join("?" * len(online_ids)) if online_ids else "NULL"
                 ), tuple(online_ids)
             ).fetchall()
@@ -650,7 +1180,7 @@ async def rate_photo(photo_id: int = Form(...), tier_id: str = Form(...), user=D
                     set_setting(db, "current_photo_id", str(nxt["id"]))
                     set_setting(db, "voting_open", "1")
                     db.close()
-                    await ws_manager.broadcast({"type": "photo_change", "photo_id": nxt["id"], "auto": True})
+                    await ws_manager.broadcast({"type": "photo_change", "photo_id": nxt["id"], "auto": True, "direction": "next"})
                     return {"ok": True, "auto_advanced": True}
                 else:
                     # Все фото просмотрены
@@ -678,7 +1208,7 @@ def search_tags(q: str = "", limit: int = 20, user=Depends(current_user)):
 def get_photo_tags(photo_id: int, user=Depends(current_user)):
     db = get_db()
     rows = db.execute("""
-        SELECT t.id as tag_id, t.name as tag_name, u.username, pt.user_id
+        SELECT t.id as tag_id, t.name as tag_name, u.username, pt.user_id, pt.is_suggestion
         FROM photo_tags pt
         JOIN tags t ON t.id = pt.tag_id
         JOIN users u ON u.id = pt.user_id
@@ -686,8 +1216,9 @@ def get_photo_tags(photo_id: int, user=Depends(current_user)):
         ORDER BY t.name
     """, (photo_id,)).fetchall()
     db.close()
-    mine = [{"id": r["tag_id"], "name": r["tag_name"]} for r in rows if r["user_id"] == user["id"]]
-    all_tags = [{"tag_id": r["tag_id"], "tag_name": r["tag_name"], "username": r["username"]} for r in rows]
+    mine = [{"id": r["tag_id"], "name": r["tag_name"]} for r in rows if r["user_id"] == user["id"] and not r["is_suggestion"]]
+    all_tags = [{"tag_id": r["tag_id"], "tag_name": r["tag_name"], "username": r["username"],
+                 "is_suggestion": bool(r["is_suggestion"])} for r in rows]
     return {"mine": mine, "all": all_tags}
 
 @app.post("/api/photo-tags/{photo_id}/add")
@@ -699,11 +1230,50 @@ def add_photo_tag(photo_id: int, tag_name: str = Form(...), user=Depends(current
         # allow adding if name exists in any form
         db.close(); raise HTTPException(404, "Тег не найден")
     try:
-        db.execute("INSERT INTO photo_tags (photo_id, user_id, tag_id) VALUES (?,?,?)",
+        # is_suggestion=0 явно — это обычный ручной тег, а не предложение автотегирования.
+        db.execute("INSERT INTO photo_tags (photo_id, user_id, tag_id, is_suggestion) VALUES (?,?,?,0)",
                    (photo_id, user["id"], tag["id"]))
         db.commit()
     except sqlite3.IntegrityError:
         pass
+    db.close()
+    return {"ok": True}
+
+@app.post("/api/photo-tags/{photo_id}/confirm")
+def confirm_suggested_tag(photo_id: int, tag_id: int = Form(...), user=Depends(current_user)):
+    """
+    Подтверждает предложенный автотегированием тег: снимает флаг is_suggestion,
+    после чего тег сразу считается обычным — виден в тир-листе, фильтрах
+    и счётчиках. По договорённости подтверждения любого ОДНОГО человека
+    достаточно — без накопления нескольких голосов.
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT id FROM photo_tags WHERE photo_id=? AND tag_id=? AND is_suggestion=1",
+        (photo_id, tag_id)
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Предложенный тег не найден (возможно, уже подтверждён)")
+    db.execute("UPDATE photo_tags SET is_suggestion=0 WHERE id=?", (row["id"],))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+@app.post("/api/photo-tags/{photo_id}/reject")
+def reject_suggested_tag(photo_id: int, tag_id: int = Form(...), user=Depends(current_user)):
+    """
+    Отклоняет предложенный автотегированием тег — полностью удаляет
+    запись-предложение. Это явное "нет, это неверно" от любого человека,
+    в отличие от простого игнорирования (когда предложение просто остаётся
+    висеть непросмотренным до тех пор, пока кто-то не подтвердит или отклонит).
+    """
+    db = get_db()
+    db.execute(
+        "DELETE FROM photo_tags WHERE photo_id=? AND tag_id=? AND is_suggestion=1",
+        (photo_id, tag_id)
+    )
+    db.commit()
     db.close()
     return {"ok": True}
 
@@ -751,14 +1321,14 @@ def photo_detail(photo_id: int, user=Depends(current_user)):
         WHERE r.photo_id=? ORDER BY u.username
     """, (photo_id,)).fetchall()
 
-    # tags with user counts
+    # tags with user counts (только подтверждённые — suggestion'ы сюда не попадают)
     tags = db.execute("""
         SELECT t.name, COUNT(pt.user_id) as cnt,
                GROUP_CONCAT(u.username, ', ') as users
         FROM photo_tags pt
         JOIN tags t ON t.id=pt.tag_id
         JOIN users u ON u.id=pt.user_id
-        WHERE pt.photo_id=?
+        WHERE pt.photo_id=? AND pt.is_suggestion=0
         GROUP BY t.id ORDER BY cnt DESC, t.name
     """, (photo_id,)).fetchall()
 
@@ -784,7 +1354,7 @@ async def next_photo(user=Depends(admin_user)):
     set_setting(db, "current_photo_id", str(nxt["id"]))
     set_setting(db, "voting_open", "1")
     db.close()
-    await ws_manager.broadcast({"type": "photo_change", "photo_id": nxt["id"]})
+    await ws_manager.broadcast({"type": "photo_change", "photo_id": nxt["id"], "direction": "next"})
     return {"done": False, "photo_id": nxt["id"]}
 
 @app.post("/api/admin/prev-photo")
@@ -798,7 +1368,7 @@ async def prev_photo(user=Depends(admin_user)):
     set_setting(db, "current_photo_id", str(prev["id"]))
     set_setting(db, "voting_open", "1")
     db.close()
-    await ws_manager.broadcast({"type": "photo_change", "photo_id": prev["id"]})
+    await ws_manager.broadcast({"type": "photo_change", "photo_id": prev["id"], "direction": "prev"})
     return {"photo_id": prev["id"]}
 
 @app.post("/api/admin/set-photo/{pid}")
@@ -853,6 +1423,30 @@ def get_auto_advance(user=Depends(admin_user)):
     db.close()
     return {"enabled": val}
 
+@app.get("/api/admin/wd14-status")
+def get_wd14_status(user=Depends(admin_user)):
+    """
+    Статус автотегирования для админ-панели: проверяет не только наличие
+    файлов модели, но и их реальный размер (см. wd14_tagger.is_available) —
+    чтобы сразу было видно частую ошибку, когда вместо ~388 МБ model.onnx
+    скачался крошечный LFS/Xet pointer-файл (0 КБ).
+    """
+    available = wd14_tagger.is_available()
+    model_size = 0
+    tags_size = 0
+    try:
+        if os.path.exists(wd14_tagger.MODEL_PATH):
+            model_size = os.path.getsize(wd14_tagger.MODEL_PATH)
+        if os.path.exists(wd14_tagger.TAGS_CSV_PATH):
+            tags_size = os.path.getsize(wd14_tagger.TAGS_CSV_PATH)
+    except OSError:
+        pass
+    return {
+        "available": available,
+        "model_size_bytes": model_size,
+        "tags_size_bytes": tags_size,
+    }
+
 @app.get("/api/online-users")
 def online_users(user=Depends(current_user)):
     """Возвращает список онлайн-пользователей (не-админов)."""
@@ -861,7 +1455,7 @@ def online_users(user=Depends(current_user)):
         return {"count": 0, "users": []}
     db = get_db()
     rows = db.execute(
-        "SELECT id, username FROM users WHERE is_admin=0 AND id IN ({})".format(
+        "SELECT id, username FROM users WHERE is_admin=0 AND is_system=0 AND id IN ({})".format(
             ",".join("?" * len(online_ids))
         ), tuple(online_ids)
     ).fetchall()
@@ -872,13 +1466,14 @@ def online_users(user=Depends(current_user)):
 
 @app.get("/api/tierlist/tags")
 def tierlist_tags(user=Depends(current_user)):
-    """Возвращает все теги, которые есть хотя бы у одного оценённого фото."""
+    """Возвращает все подтверждённые теги, которые есть хотя бы у одного оценённого фото."""
     db = get_db()
     rows = db.execute("""
         SELECT DISTINCT t.id, t.name
         FROM tags t
         JOIN photo_tags pt ON pt.tag_id = t.id
         JOIN ratings r ON r.photo_id = pt.photo_id
+        WHERE pt.is_suggestion = 0
         ORDER BY t.name
     """).fetchall()
     db.close()
@@ -921,7 +1516,7 @@ def tierlist(tag_ids: str = "", exclude_tag_ids: str = "", user=Depends(current_
         filtered_ids = db.execute(f"""
             SELECT photo_id
             FROM photo_tags
-            WHERE tag_id IN ({placeholders})
+            WHERE tag_id IN ({placeholders}) AND is_suggestion = 0
             GROUP BY photo_id
             HAVING COUNT(DISTINCT tag_id) = {len(selected_tag_ids)}
         """, selected_tag_ids).fetchall()
@@ -937,7 +1532,7 @@ def tierlist(tag_ids: str = "", exclude_tag_ids: str = "", user=Depends(current_
         excl_rows = db.execute(f"""
             SELECT DISTINCT photo_id
             FROM photo_tags
-            WHERE tag_id IN ({excl_placeholders})
+            WHERE tag_id IN ({excl_placeholders}) AND is_suggestion = 0
         """, excluded_tag_ids).fetchall()
         excl_photo_ids = {r["photo_id"] for r in excl_rows}
         allowed_ids -= excl_photo_ids
@@ -994,7 +1589,7 @@ def stats(user=Depends(admin_user)):
     r = {
         "total_photos": db.execute("SELECT COUNT(*) FROM photos").fetchone()[0],
         "rated_photos": db.execute("SELECT COUNT(DISTINCT photo_id) FROM ratings").fetchone()[0],
-        "total_users": db.execute("SELECT COUNT(*) FROM users WHERE is_admin=0").fetchone()[0],
+        "total_users": db.execute("SELECT COUNT(*) FROM users WHERE is_admin=0 AND is_system=0").fetchone()[0],
         "total_votes": db.execute("SELECT COUNT(*) FROM ratings").fetchone()[0],
     }
     db.close(); return r
@@ -1003,7 +1598,7 @@ def stats(user=Depends(admin_user)):
 def reset_db(user=Depends(admin_user)):
     db = get_db()
     # delete all non-admin users
-    db.execute("DELETE FROM users WHERE is_admin=0")
+    db.execute("DELETE FROM users WHERE is_admin=0 AND is_system=0")
     # delete all photos from disk
     photos = db.execute("SELECT filename FROM photos").fetchall()
     for p in photos:
@@ -1036,6 +1631,7 @@ def users_list(user=Depends(current_user)):
     rows = db.execute(
         "SELECT u.id, u.username, u.is_admin, COUNT(r.id) as vote_count "
         "FROM users u LEFT JOIN ratings r ON r.user_id=u.id "
+        "WHERE u.is_system=0 "
         "GROUP BY u.id ORDER BY vote_count DESC, u.username"
     ).fetchall()
     db.close()
@@ -1096,7 +1692,7 @@ def user_stats(uid: int, user=Depends(current_user)):
         pp = ",".join("?" * len(top_photos))
         fav_tags = [dict(r) for r in db.execute(
             f"SELECT t.name, COUNT(*) as cnt FROM photo_tags pt "
-            f"JOIN tags t ON t.id=pt.tag_id WHERE pt.photo_id IN ({pp}) "
+            f"JOIN tags t ON t.id=pt.tag_id WHERE pt.photo_id IN ({pp}) AND pt.is_suggestion=0 "
             f"GROUP BY t.id ORDER BY cnt DESC LIMIT 12",
             top_photos
         ).fetchall()]
