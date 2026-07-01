@@ -46,24 +46,38 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 
 class WSManager:
     def __init__(self):
-        # ws -> user_id (None for unauthenticated)
-        self.connections: dict[WebSocket, Optional[int]] = {}
+        # ws -> (user_id, session_id); user_id может быть None (анонимный токен истёк),
+        # session_id может быть None (подключение к списку сессий, не к конкретной)
+        self.connections: dict[WebSocket, tuple] = {}
 
-    async def connect(self, ws: WebSocket, user_id: Optional[int] = None):
+    async def connect(self, ws: WebSocket, user_id: Optional[int] = None, session_id: Optional[int] = None):
         await ws.accept()
-        self.connections[ws] = user_id
+        self.connections[ws] = (user_id, session_id)
 
     def disconnect(self, ws: WebSocket):
         self.connections.pop(ws, None)
 
-    def online_user_ids(self) -> set[int]:
-        """Возвращает множество user_id пользователей онлайн (без None)."""
-        return {uid for uid in self.connections.values() if uid is not None}
+    def online_user_ids(self, session_id: Optional[int] = None) -> set[int]:
+        """Возвращает множество user_id онлайн. Если session_id указан —
+        только те, кто подключён именно к этой сессии."""
+        result = set()
+        for uid, sid in self.connections.values():
+            if uid is None:
+                continue
+            if session_id is not None and sid != session_id:
+                continue
+            result.add(uid)
+        return result
 
-    async def broadcast(self, data: dict):
+    async def broadcast(self, data: dict, session_id: Optional[int] = None):
+        """Если session_id указан — рассылает только подключениям этой сессии.
+        Если не указан — рассылает всем (используется для общих уведомлений,
+        например 'появились новые фото после импорта')."""
         msg = json.dumps(data, ensure_ascii=False)
         dead = []
-        for ws in self.connections:
+        for ws, (uid, sid) in self.connections.items():
+            if session_id is not None and sid != session_id:
+                continue
             try:
                 await ws.send_text(msg)
             except Exception:
@@ -74,7 +88,7 @@ class WSManager:
 ws_manager = WSManager()
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket, token: Optional[str] = None):
+async def websocket_endpoint(ws: WebSocket, token: Optional[str] = None, session_id: Optional[int] = None):
     user_id = None
     if token:
         try:
@@ -82,7 +96,7 @@ async def websocket_endpoint(ws: WebSocket, token: Optional[str] = None):
             user_id = int(d["sub"])
         except Exception:
             pass
-    await ws_manager.connect(ws, user_id)
+    await ws_manager.connect(ws, user_id, session_id)
     try:
         while True:
             await ws.receive_text()
@@ -115,6 +129,22 @@ def get_db():
 
 def init_db():
     db = get_db()
+
+    # ── МИГРАЦИЯ НА СЕССИИ: если ratings уже существует со старой схемой
+    # (без колонки session_id — то есть это база до введения системы сессий),
+    # переименовываем её, чтобы дальше создать новую таблицу с правильной
+    # схемой, а старые данные перенесём ниже в "Сессию №1".
+    old_ratings_exists = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='ratings'"
+    ).fetchone()
+    needs_ratings_migration = False
+    if old_ratings_exists:
+        existing_cols = [r[1] for r in db.execute("PRAGMA table_info(ratings)").fetchall()]
+        if 'session_id' not in existing_cols:
+            needs_ratings_migration = True
+            db.execute("ALTER TABLE ratings RENAME TO ratings_old_pre_sessions")
+            db.commit()
+
     db.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,22 +161,10 @@ def init_db():
         position INTEGER DEFAULT 0,
         uploaded_at TEXT DEFAULT (datetime('now'))
     );
-    CREATE TABLE IF NOT EXISTS ratings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        photo_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        tier_id TEXT NOT NULL,
-        created_at TEXT DEFAULT (datetime('now')),
-        UNIQUE(photo_id, user_id)
-    );
     CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT
     );
-    INSERT OR IGNORE INTO settings VALUES ('current_photo_id', NULL);
-    INSERT OR IGNORE INTO settings VALUES ('voting_open', '1');
-    INSERT OR IGNORE INTO settings VALUES ('tiers', NULL);
-    INSERT OR IGNORE INTO settings VALUES ('auto_advance', '0');
     CREATE TABLE IF NOT EXISTS tags (
         id INTEGER PRIMARY KEY,
         name TEXT UNIQUE NOT NULL,
@@ -178,7 +196,47 @@ def init_db():
         last_sync_at TEXT,
         last_sync_added INTEGER DEFAULT 0,
         last_sync_errors INTEGER DEFAULT 0,
+        last_sync_error_msg TEXT,
         enabled INTEGER DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        creator_user_id INTEGER NOT NULL,
+        tiers TEXT NOT NULL,
+        current_photo_id INTEGER,
+        voting_open INTEGER DEFAULT 1,
+        auto_advance INTEGER DEFAULT 0,
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_code ON sessions(code);
+    CREATE TABLE IF NOT EXISTS session_photos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL,
+        photo_id INTEGER NOT NULL,
+        position INTEGER DEFAULT 0,
+        UNIQUE(session_id, photo_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_photos_session ON session_photos(session_id);
+    CREATE TABLE IF NOT EXISTS ratings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL,
+        photo_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        tier_id TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(session_id, photo_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ratings_session ON ratings(session_id);
+    CREATE TABLE IF NOT EXISTS published_tierlist (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        source_session_id INTEGER,
+        title TEXT,
+        snapshot_json TEXT NOT NULL,
+        published_by INTEGER,
+        published_at TEXT DEFAULT (datetime('now'))
     );
     """)
     cols = [r[1] for r in db.execute("PRAGMA table_info(ratings)").fetchall()]
@@ -209,6 +267,9 @@ def init_db():
         #     ни в тир-листе, ни в фильтрах по тегам, ни в счётчиках "сколько
         #     пользователей поставили тег".
         db.execute("ALTER TABLE photo_tags ADD COLUMN is_suggestion INTEGER DEFAULT 0")
+    gdrive_watch_cols = [r[1] for r in db.execute("PRAGMA table_info(gdrive_watch)").fetchall()]
+    if 'last_sync_error_msg' not in gdrive_watch_cols:
+        db.execute("ALTER TABLE gdrive_watch ADD COLUMN last_sync_error_msg TEXT")
     # Системный пользователь, от имени которого пишутся автотеги WD14.
     # is_system=1 — исключается из всех счётчиков "обычных" людей
     # (прогресс-бар голосования, список участников статистики и т.п.).
@@ -219,6 +280,75 @@ def init_db():
             "INSERT INTO users (username, password_hash, is_admin, is_system) VALUES (?,?,0,1)",
             (AUTO_TAGGER_USERNAME, random_pw_hash)
         )
+
+    # ── МИГРАЦИЯ НА СЕССИИ (продолжение) ────────────────────────────────────
+    # Если выше была обнаружена старая таблица ratings_old_pre_sessions —
+    # переносим все накопленные голоса и текущие глобальные настройки
+    # (тиры, текущее фото, открыто/закрыто голосование) в новую "Сессию №1",
+    # чтобы старые данные не потерялись при переходе на систему сессий.
+    if needs_ratings_migration:
+        old_rows = db.execute("SELECT * FROM ratings_old_pre_sessions").fetchall()
+
+        old_tiers_raw = db.execute("SELECT value FROM settings WHERE key='tiers'").fetchone()
+        try:
+            old_tiers = json.loads(old_tiers_raw["value"]) if old_tiers_raw and old_tiers_raw["value"] else None
+        except Exception:
+            old_tiers = None
+        if not old_tiers:
+            old_tiers = DEFAULT_TIERS[:]
+
+        old_current_photo_row = db.execute("SELECT value FROM settings WHERE key='current_photo_id'").fetchone()
+        old_current_photo_id = old_current_photo_row["value"] if old_current_photo_row else None
+        old_voting_open_row = db.execute("SELECT value FROM settings WHERE key='voting_open'").fetchone()
+        old_voting_open = 1 if (not old_voting_open_row or old_voting_open_row["value"] == "1") else 0
+        old_auto_advance_row = db.execute("SELECT value FROM settings WHERE key='auto_advance'").fetchone()
+        old_auto_advance = 1 if (old_auto_advance_row and old_auto_advance_row["value"] == "1") else 0
+
+        # Создателем "Сессии №1" делаем первого зарегистрированного админа сайта
+        # (если такого нет — первого зарегистрированного пользователя вообще).
+        owner_row = db.execute(
+            "SELECT id FROM users WHERE is_admin=1 AND is_system=0 ORDER BY id LIMIT 1"
+        ).fetchone() or db.execute(
+            "SELECT id FROM users WHERE is_system=0 ORDER BY id LIMIT 1"
+        ).fetchone()
+
+        if owner_row:
+            import secrets, string
+            _alphabet = string.ascii_lowercase + string.digits
+            code = "".join(secrets.choice(_alphabet) for _ in range(8))
+            for _ in range(5):
+                if not db.execute("SELECT 1 FROM sessions WHERE code=?", (code,)).fetchone():
+                    break
+                code = "".join(secrets.choice(_alphabet) for _ in range(8))
+
+            cur = db.execute(
+                "INSERT INTO sessions (code, title, creator_user_id, tiers, current_photo_id, voting_open, auto_advance) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (code, "Сессия №1", owner_row["id"], json.dumps(old_tiers, ensure_ascii=False),
+                 old_current_photo_id, old_voting_open, old_auto_advance)
+            )
+            session_id = cur.lastrowid
+
+            # Все существующие фото входят в Сессию №1 в их текущем глобальном порядке.
+            photo_rows = db.execute("SELECT id FROM photos ORDER BY position").fetchall()
+            db.executemany(
+                "INSERT OR IGNORE INTO session_photos (session_id, photo_id, position) VALUES (?,?,?)",
+                [(session_id, r["id"], i) for i, r in enumerate(photo_rows)]
+            )
+
+            # Переносим все старые голоса как голоса в Сессии №1.
+            db.executemany(
+                "INSERT OR IGNORE INTO ratings (session_id, photo_id, user_id, tier_id, created_at) VALUES (?,?,?,?,?)",
+                [(session_id, r["photo_id"], r["user_id"], r["tier_id"], r["created_at"]) for r in old_rows]
+            )
+            print(f"[migration] Старые данные перенесены в 'Сессию №1' (id={session_id}, "
+                  f"код={code}): {len(photo_rows)} фото, {len(old_rows)} голосов.")
+        else:
+            print("[migration] Не найдено ни одного пользователя для создания владельца "
+                  "'Сессии №1' — старые голоса остались только в ratings_old_pre_sessions.")
+
+        db.execute("DROP TABLE IF EXISTS ratings_old_pre_sessions")
+
     db.commit()
     db.close()
 
@@ -249,13 +379,78 @@ def set_setting(db, key, value):
     db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, value))
     db.commit()
 
-def get_tiers(db):
-    raw = get_setting(db, "tiers")
+def get_tiers_for_session(session_row):
+    """Парсит JSON тиров конкретной сессии (sessions.tiers). Сессия передаётся
+    как уже полученная Row/dict — чтобы не делать лишний SELECT там, где
+    сессия уже на руках."""
     try:
-        t = json.loads(raw) if raw else None
+        t = json.loads(session_row["tiers"]) if session_row["tiers"] else None
         if t: return sorted(t, key=lambda x: x.get("order", 0))
     except: pass
     return DEFAULT_TIERS[:]
+
+def get_favorite_tag_ids_for_user(db, user_id: int, limit: int = 20) -> list[int]:
+    """
+    Любимые теги пользователя по ВСЕМ его сессиям сразу — те же принципы,
+    что в /api/sessions/{id}/user-stats/{uid} (топ-теги по высоко оценённым
+    фото), только не ограничены одной сессией. Используется для приоритизации
+    списка тегов в форме создания новой сессии: тегам, которые человек
+    регулярно ставил высокую оценку, нужно показываться первыми.
+
+    "Высоко оценённое" определяется как верхняя половина тиров В РАМКАХ
+    КАЖДОЙ СЕССИИ — так как тиры разные в разных сессиях, нет единого
+    глобального "верхнего тира", но относительная позиция (верхняя половина
+    своего же набора тиров) сопоставима между сессиями.
+    """
+    sessions_rated = db.execute(
+        "SELECT DISTINCT session_id FROM ratings WHERE user_id=?", (user_id,)
+    ).fetchall()
+    if not sessions_rated:
+        return []
+
+    top_photo_ids = set()
+    for srow in sessions_rated:
+        sid = srow["session_id"]
+        session = db.execute("SELECT tiers FROM sessions WHERE id=?", (sid,)).fetchone()
+        if not session:
+            continue
+        tiers = get_tiers_for_session(session)
+        n = len(tiers)
+        top_n = max(1, n // 2)
+        top_tier_ids = [t["id"] for t in tiers[:top_n]]
+        if not top_tier_ids:
+            continue
+        ph = ",".join("?" * len(top_tier_ids))
+        rows = db.execute(
+            f"SELECT photo_id FROM ratings WHERE session_id=? AND user_id=? AND tier_id IN ({ph})",
+            [sid, user_id] + top_tier_ids
+        ).fetchall()
+        top_photo_ids.update(r["photo_id"] for r in rows)
+
+    if not top_photo_ids:
+        return []
+
+    pp = ",".join("?" * len(top_photo_ids))
+    rows = db.execute(
+        f"SELECT tag_id, COUNT(*) as cnt FROM photo_tags "
+        f"WHERE photo_id IN ({pp}) AND is_suggestion=0 "
+        f"GROUP BY tag_id ORDER BY cnt DESC LIMIT ?",
+        list(top_photo_ids) + [limit]
+    ).fetchall()
+    return [r["tag_id"] for r in rows]
+
+def get_session_or_404(db, session_id: int):
+    row = db.execute("SELECT * FROM sessions WHERE id=? AND is_active=1", (session_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Сессия не найдена или была завершена")
+    return row
+
+def generate_session_code() -> str:
+    """Короткий код для ссылки на сессию — достаточно энтропии, чтобы не
+    угадать чужую сессию перебором, но короче UUID для удобства ввода вручную."""
+    import secrets, string
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(8))
 
 _auto_tagger_user_id_cache = None
 
@@ -355,31 +550,334 @@ def me(user=Depends(current_user)):
     db.close()
     return dict(row)
 
-# ── TIERS CONFIG ──────────────────────────────────────────────────────────────
+# ── SESSIONS ────────────────────────────────────────────────────────────────────
+# Любой зарегистрированный пользователь может создать сессию оценивания —
+# внутри неё он становится "админом" (создателем) этой конкретной сессии,
+# без глобальных прав на сайте. Другие подключаются по коду/ссылке или
+# выбирают сессию из общего списка активных. Голоса, тиры и текущее фото
+# полностью изолированы между сессиями; теги на фото остаются общими.
 
-@app.get("/api/tiers")
-def api_get_tiers(user=Depends(current_user)):
-    db = get_db(); t = get_tiers(db); db.close(); return t
+@app.get("/api/sessions")
+def list_sessions(user=Depends(current_user)):
+    """Список активных сессий — для экрана 'Активные сессии', куда можно
+    зайти без кода по клику."""
+    db = get_db()
+    rows = db.execute("""
+        SELECT s.id, s.code, s.title, s.created_at, s.voting_open,
+               u.username as creator_username,
+               (SELECT COUNT(*) FROM session_photos sp WHERE sp.session_id=s.id) as photo_count,
+               (SELECT COUNT(DISTINCT user_id) FROM ratings r WHERE r.session_id=s.id) as participant_count
+        FROM sessions s
+        JOIN users u ON u.id = s.creator_user_id
+        WHERE s.is_active = 1
+        ORDER BY s.created_at DESC
+    """).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
 
-@app.post("/api/admin/tiers")
-def api_set_tiers(body: dict, user=Depends(admin_user)):
-    tiers = body.get("tiers", [])
-    if not tiers or len(tiers) < 2:
+@app.post("/api/sessions")
+def create_session(body: dict, user=Depends(current_user)):
+    """
+    Создаёт новую сессию оценивания.
+    body:
+      title: str — название сессии
+      tiers: list — тиры (как в /api/sessions/{id}/tiers), минимум 2
+      photo_filter: "all" | "tag" — какая подборка фото войдёт в сессию
+      tag_id: int (если photo_filter == "tag") — id тега для фильтра
+      include_suggestions: bool — включать ли фото, у которых тег есть
+                            только как неподтверждённое предложение AI
+      shuffle: bool — перемешать порядок фото в сессии (по умолчанию — да)
+    """
+    title = (body.get("title") or "").strip()[:80] or "Без названия"
+    tiers = body.get("tiers") or DEFAULT_TIERS[:]
+    if len(tiers) < 2:
         raise HTTPException(400, "Минимум 2 тира")
     if len(tiers) > 10:
         raise HTTPException(400, "Максимум 10 тиров")
-    # validate
+    for i, t in enumerate(tiers):
+        if not (t.get("label") or "").strip():
+            raise HTTPException(400, f"Тир {i+1}: пустое название")
+        t["id"] = t.get("id") or str(uuid.uuid4())[:8]
+        t["order"] = i
+        t["label"] = t["label"].strip()[:30]
+        t["color"] = t.get("color", "#888")
+
+    photo_filter = body.get("photo_filter", "all")
+    tag_id = body.get("tag_id")
+    include_suggestions = bool(body.get("include_suggestions"))
+    do_shuffle = body.get("shuffle", True)
+
+    db = get_db()
+
+    if photo_filter == "tag" and tag_id:
+        if include_suggestions:
+            rows = db.execute(
+                "SELECT DISTINCT photo_id FROM photo_tags WHERE tag_id=?", (tag_id,)
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT DISTINCT photo_id FROM photo_tags WHERE tag_id=? AND is_suggestion=0", (tag_id,)
+            ).fetchall()
+        photo_ids = [r["photo_id"] for r in rows]
+    else:
+        rows = db.execute("SELECT id FROM photos ORDER BY position").fetchall()
+        photo_ids = [r["id"] for r in rows]
+
+    if not photo_ids:
+        db.close()
+        raise HTTPException(400, "По выбранному фильтру не найдено ни одного фото")
+
+    if do_shuffle:
+        import random
+        random.shuffle(photo_ids)
+
+    code = generate_session_code()
+    # на случай редчайшей коллизии кода — перегенерируем пару раз
+    for _ in range(5):
+        if not db.execute("SELECT 1 FROM sessions WHERE code=?", (code,)).fetchone():
+            break
+        code = generate_session_code()
+
+    cur = db.execute(
+        "INSERT INTO sessions (code, title, creator_user_id, tiers, voting_open) VALUES (?,?,?,?,1)",
+        (code, title, user["id"], json.dumps(tiers, ensure_ascii=False))
+    )
+    session_id = cur.lastrowid
+
+    db.executemany(
+        "INSERT INTO session_photos (session_id, photo_id, position) VALUES (?,?,?)",
+        [(session_id, pid, i) for i, pid in enumerate(photo_ids)]
+    )
+    first_photo_id = photo_ids[0]
+    db.execute("UPDATE sessions SET current_photo_id=? WHERE id=?", (first_photo_id, session_id))
+    db.commit()
+    db.close()
+
+    return {"id": session_id, "code": code, "title": title, "photo_count": len(photo_ids)}
+
+@app.get("/api/sessions/{session_id}")
+def get_session_info(session_id: int, user=Depends(current_user)):
+    db = get_db()
+    session = get_session_or_404(db, session_id)
+    photo_count = db.execute(
+        "SELECT COUNT(*) FROM session_photos WHERE session_id=?", (session_id,)
+    ).fetchone()[0]
+    participant_count = db.execute(
+        "SELECT COUNT(DISTINCT user_id) FROM ratings WHERE session_id=?", (session_id,)
+    ).fetchone()[0]
+    db.close()
+    d = dict(session)
+    d["tiers"] = get_tiers_for_session(session)
+    d["photo_count"] = photo_count
+    d["participant_count"] = participant_count
+    d["is_owner"] = session["creator_user_id"] == user["id"]
+    return d
+
+@app.get("/api/sessions/by-code/{code}")
+def get_session_by_code(code: str, user=Depends(current_user)):
+    """Резолвит код сессии (из ссылки или введённый вручную) в session_id —
+    для перехода на экран голосования по короткой ссылке/коду."""
+    db = get_db()
+    row = db.execute("SELECT id FROM sessions WHERE code=? AND is_active=1", (code.strip().lower(),)).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Сессия с таким кодом не найдена или завершена")
+    return {"session_id": row["id"]}
+
+@app.post("/api/sessions/{session_id}/end")
+def end_session(session_id: int, user=Depends(current_user)):
+    """Завершает сессию (мягко — is_active=0, данные не удаляются). Доступно
+    только создателю сессии."""
+    db = get_db()
+    session = get_session_or_404(db, session_id)
+    if session["creator_user_id"] != user["id"] and not user["is_admin"]:
+        db.close()
+        raise HTTPException(403, "Завершить сессию может только её создатель")
+    db.execute("UPDATE sessions SET is_active=0 WHERE id=?", (session_id,))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+# ── PUBLIC GALLERY ────────────────────────────────────────────────────────────
+# Просмотр всех фото вне контекста сессий — без возможности голосовать или
+# ставить теги, только смотреть и фильтровать. Плюс витрина "опубликованного"
+# тир-листа — замороженный снимок тир-листа какой-то сессии, который
+# сайт-админ явно публикует на главную (см. ниже).
+
+@app.get("/api/gallery/photos")
+def gallery_photos(tag_id: Optional[int] = None, include_suggestions: bool = False, user=Depends(current_user)):
+    """
+    Список фото для галереи. tag_id — необязательный фильтр (показывать
+    только фото с этим тегом). include_suggestions согласуется с тем же
+    переключателем, что в /api/gallery/tags — если включён, фильтр по тегу
+    учитывает и неподтверждённые AI-предложения (иначе выбор AI-тега в
+    фильтре вернул бы пустой список, хотя сам тег показывается).
+    """
+    db = get_db()
+    if tag_id:
+        suggestion_clause = "" if include_suggestions else "AND pt.is_suggestion = 0"
+        rows = db.execute(f"""
+            SELECT DISTINCT p.id, p.filename, p.original_name
+            FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id
+            WHERE pt.tag_id = ? {suggestion_clause}
+            ORDER BY p.position
+        """, (tag_id,)).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id, filename, original_name FROM photos ORDER BY position"
+        ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+@app.get("/api/gallery/tags")
+def gallery_tags(include_suggestions: bool = False, user=Depends(current_user)):
+    """
+    Полный список тегов для фильтра в галерее, с количеством фото у каждого.
+    В отличие от /api/tierlist/tags (витрина топ-10 для формы создания сессии),
+    здесь нужен ПОЛНЫЙ список без лимита, отсортированный по алфавиту — это
+    фильтр-справочник, а не подборка карточек.
+
+    include_suggestions=False (по умолчанию): только теги с хотя бы одним
+        ПОДТВЕРЖДЁННЫМ фото.
+    include_suggestions=True: учитываются также теги, которые есть только
+        как неподтверждённое AI-предложение — отдельный переключатель в
+        галерее, а не смешивание с обычными тегами в одном списке.
+    """
+    db = get_db()
+    suggestion_clause = "" if include_suggestions else "AND pt.is_suggestion = 0"
+    rows = db.execute(f"""
+        SELECT t.id, t.name, COUNT(DISTINCT pt.photo_id) as photo_count,
+               MAX(CASE WHEN pt.is_suggestion = 0 THEN 1 ELSE 0 END) as has_confirmed
+        FROM tags t JOIN photo_tags pt ON pt.tag_id = t.id
+        WHERE 1=1 {suggestion_clause}
+        GROUP BY t.id
+        HAVING photo_count > 0
+        ORDER BY t.name
+    """).fetchall()
+    db.close()
+    return [{"id": r["id"], "name": r["name"], "photo_count": r["photo_count"],
+             "has_confirmed": bool(r["has_confirmed"])} for r in rows]
+
+@app.get("/api/gallery/published-tierlist")
+def get_published_tierlist(user=Depends(current_user)):
+    """Текущий опубликованный на главной снимок тир-листа, если есть."""
+    db = get_db()
+    row = db.execute("""
+        SELECT pt.*, u.username as published_by_username
+        FROM published_tierlist pt LEFT JOIN users u ON u.id = pt.published_by
+        WHERE pt.id = 1
+    """).fetchone()
+    db.close()
+    if not row:
+        return None
+    snapshot = json.loads(row["snapshot_json"])
+    return {
+        "title": row["title"],
+        "published_by": row["published_by_username"],
+        "published_at": row["published_at"],
+        "source_session_id": row["source_session_id"],
+        **snapshot,
+    }
+
+@app.get("/api/admin/publishable-sessions")
+def list_publishable_sessions(user=Depends(admin_user)):
+    """
+    Список ВСЕХ сессий (активных и завершённых) с превью тир-листа — для
+    экрана выбора "какую сессию опубликовать на главную". Доступно только
+    сайт-админу.
+    """
+    db = get_db()
+    rows = db.execute("""
+        SELECT s.id, s.title, s.is_active, s.created_at,
+               u.username as creator_username,
+               (SELECT COUNT(*) FROM ratings r WHERE r.session_id=s.id) as vote_count,
+               (SELECT COUNT(DISTINCT r.photo_id) FROM ratings r WHERE r.session_id=s.id) as rated_photo_count
+        FROM sessions s JOIN users u ON u.id = s.creator_user_id
+        ORDER BY s.created_at DESC
+    """).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+@app.post("/api/admin/publish-tierlist/{session_id}")
+def publish_tierlist_snapshot(session_id: int, user=Depends(admin_user)):
+    """
+    Публикует ЗАМОРОЖЕННЫЙ снимок тир-листа выбранной сессии на главную
+    страницу (галерею). Снимок не обновляется сам, даже если в исходной
+    сессии продолжат голосовать — чтобы повторно опубликовать актуальную
+    версию, нужно вызвать этот эндпоинт снова. Заменяет предыдущую публикацию,
+    если она была (на главной всегда не более одного опубликованного тир-листа).
+    """
+    db = get_db()
+    session = db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not session:
+        db.close()
+        raise HTTPException(404, "Сессия не найдена")
+
+    snapshot = compute_session_tierlist(db, session_id, session_row=session)
+    db.execute("""
+        INSERT INTO published_tierlist (id, source_session_id, title, snapshot_json, published_by, published_at)
+        VALUES (1, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            source_session_id=excluded.source_session_id,
+            title=excluded.title,
+            snapshot_json=excluded.snapshot_json,
+            published_by=excluded.published_by,
+            published_at=excluded.published_at
+    """, (session_id, session["title"], json.dumps(snapshot, ensure_ascii=False),
+          user["id"], datetime.utcnow().isoformat()))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+@app.delete("/api/admin/publish-tierlist")
+def unpublish_tierlist_snapshot(user=Depends(admin_user)):
+    """Снимает текущий опубликованный тир-лист с главной страницы."""
+    db = get_db()
+    db.execute("DELETE FROM published_tierlist WHERE id=1")
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+# ── TIERS CONFIG (per session) ─────────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/tiers")
+def api_get_session_tiers(session_id: int, user=Depends(current_user)):
+    db = get_db()
+    session = get_session_or_404(db, session_id)
+    t = get_tiers_for_session(session)
+    db.close()
+    return t
+
+@app.post("/api/sessions/{session_id}/tiers")
+def api_set_session_tiers(session_id: int, body: dict, user=Depends(current_user)):
+    db = get_db()
+    session = get_session_or_404(db, session_id)
+    if session["creator_user_id"] != user["id"] and not user["is_admin"]:
+        db.close()
+        raise HTTPException(403, "Менять тиры может только создатель сессии")
+
+    tiers = body.get("tiers", [])
+    if not tiers or len(tiers) < 2:
+        db.close()
+        raise HTTPException(400, "Минимум 2 тира")
+    if len(tiers) > 10:
+        db.close()
+        raise HTTPException(400, "Максимум 10 тиров")
     ids = set()
     for i, t in enumerate(tiers):
         if not t.get("label", "").strip():
+            db.close()
             raise HTTPException(400, f"Тир {i+1}: пустое название")
         t["id"] = t.get("id") or str(uuid.uuid4())[:8]
         t["order"] = i
         t["label"] = t["label"].strip()[:30]
         t["color"] = t.get("color", "#888")
         ids.add(t["id"])
-    db = get_db()
-    set_setting(db, "tiers", json.dumps(tiers, ensure_ascii=False))
+    db.execute("UPDATE sessions SET tiers=? WHERE id=?",
+               (json.dumps(tiers, ensure_ascii=False), session_id))
+    db.commit()
     db.close()
     return tiers
 
@@ -521,7 +1019,7 @@ async def gdrive_download_file(file_id: str) -> bytes:
 
 
 @app.post("/api/admin/import-yadisk")
-async def import_yadisk(public_url: str = Form(...), user=Depends(admin_user)):
+async def import_yadisk(public_url: str = Form(...), user=Depends(current_user)):
     """
     Сканирует публичную папку Яндекс.Диска и импортирует все изображения.
     Уже существующие файлы (по имени) пропускаются.
@@ -582,7 +1080,7 @@ async def import_yadisk(public_url: str = Form(...), user=Depends(admin_user)):
 
 
 @app.get("/api/admin/preview-yadisk")
-async def preview_yadisk(public_url: str, user=Depends(admin_user)):
+async def preview_yadisk(public_url: str, user=Depends(current_user)):
     """Возвращает список файлов в папке без скачивания."""
     try:
         files = await yadisk_list_files(public_url)
@@ -701,7 +1199,7 @@ async def yadisk_sync_loop():
 
 
 @app.get("/api/admin/yadisk-watch")
-def get_yadisk_watch(user=Depends(admin_user)):
+def get_yadisk_watch(user=Depends(current_user)):
     db = get_db()
     row = db.execute("SELECT * FROM yadisk_watch WHERE id=1").fetchone()
     db.close()
@@ -712,7 +1210,7 @@ def get_yadisk_watch(user=Depends(admin_user)):
 async def set_yadisk_watch(
     public_url: str = Form(...),
     interval_minutes: int = Form(60),
-    user=Depends(admin_user)
+    user=Depends(current_user)
 ):
     db = get_db()
     db.execute(
@@ -728,7 +1226,7 @@ async def set_yadisk_watch(
 
 
 @app.delete("/api/admin/yadisk-watch")
-def delete_yadisk_watch(user=Depends(admin_user)):
+def delete_yadisk_watch(user=Depends(current_user)):
     db = get_db()
     db.execute("DELETE FROM yadisk_watch WHERE id=1")
     db.commit(); db.close()
@@ -736,7 +1234,7 @@ def delete_yadisk_watch(user=Depends(admin_user)):
 
 
 @app.post("/api/admin/yadisk-watch/sync-now")
-async def yadisk_watch_sync_now(user=Depends(admin_user)):
+async def yadisk_watch_sync_now(user=Depends(current_user)):
     result = await yadisk_sync_once()
     return result
 
@@ -747,7 +1245,7 @@ async def yadisk_watch_sync_now(user=Depends(admin_user)):
 # плоский список — без сохранения структуры, как и договаривались.
 
 @app.post("/api/admin/import-gdrive")
-async def import_gdrive(folder_url: str = Form(...), user=Depends(admin_user)):
+async def import_gdrive(folder_url: str = Form(...), user=Depends(current_user)):
     """
     Сканирует публичную папку Google Drive (включая подпапки) и импортирует
     все изображения. Уже существующие файлы (по имени) пропускаются.
@@ -807,7 +1305,7 @@ async def import_gdrive(folder_url: str = Form(...), user=Depends(admin_user)):
 
 
 @app.get("/api/admin/preview-gdrive")
-async def preview_gdrive(folder_url: str, user=Depends(admin_user)):
+async def preview_gdrive(folder_url: str, user=Depends(current_user)):
     """Возвращает список файлов в папке без скачивания."""
     try:
         files = await gdrive_list_files(folder_url)
@@ -853,8 +1351,8 @@ async def gdrive_sync_once() -> dict:
         except Exception as e:
             db = get_db()
             db.execute(
-                "UPDATE gdrive_watch SET last_sync_at=?, last_sync_added=0, last_sync_errors=-1 WHERE id=1",
-                (datetime.utcnow().isoformat(),)
+                "UPDATE gdrive_watch SET last_sync_at=?, last_sync_added=0, last_sync_errors=-1, last_sync_error_msg=? WHERE id=1",
+                (datetime.utcnow().isoformat(), str(e))
             )
             db.commit(); db.close()
             return {"added": 0, "errors": -1, "error_msg": str(e)}
@@ -881,7 +1379,7 @@ async def gdrive_sync_once() -> dict:
 
         db = get_db()
         db.execute(
-            "UPDATE gdrive_watch SET last_sync_at=?, last_sync_added=?, last_sync_errors=? WHERE id=1",
+            "UPDATE gdrive_watch SET last_sync_at=?, last_sync_added=?, last_sync_errors=?, last_sync_error_msg=NULL WHERE id=1",
             (datetime.utcnow().isoformat(), added, errors)
         )
         db.commit(); db.close()
@@ -927,7 +1425,7 @@ async def gdrive_sync_loop():
 
 
 @app.get("/api/admin/gdrive-watch")
-def get_gdrive_watch(user=Depends(admin_user)):
+def get_gdrive_watch(user=Depends(current_user)):
     db = get_db()
     row = db.execute("SELECT * FROM gdrive_watch WHERE id=1").fetchone()
     db.close()
@@ -938,7 +1436,7 @@ def get_gdrive_watch(user=Depends(admin_user)):
 async def set_gdrive_watch(
     folder_url: str = Form(...),
     interval_minutes: int = Form(60),
-    user=Depends(admin_user)
+    user=Depends(current_user)
 ):
     db = get_db()
     db.execute(
@@ -954,7 +1452,7 @@ async def set_gdrive_watch(
 
 
 @app.delete("/api/admin/gdrive-watch")
-def delete_gdrive_watch(user=Depends(admin_user)):
+def delete_gdrive_watch(user=Depends(current_user)):
     db = get_db()
     db.execute("DELETE FROM gdrive_watch WHERE id=1")
     db.commit(); db.close()
@@ -962,7 +1460,7 @@ def delete_gdrive_watch(user=Depends(admin_user)):
 
 
 @app.post("/api/admin/gdrive-watch/sync-now")
-async def gdrive_watch_sync_now(user=Depends(admin_user)):
+async def gdrive_watch_sync_now(user=Depends(current_user)):
     result = await gdrive_sync_once()
     return result
 
@@ -970,7 +1468,7 @@ async def gdrive_watch_sync_now(user=Depends(admin_user)):
 # ── PHOTOS ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/admin/photos/upload")
-async def upload_photos(files: list[UploadFile] = File(...), user=Depends(admin_user)):
+async def upload_photos(files: list[UploadFile] = File(...), user=Depends(current_user)):
     db = get_db(); added = 0
     new_photos = []  # (photo_id, full_path) — для автотегирования после вставки
     for f in files:
@@ -996,7 +1494,7 @@ async def upload_photos(files: list[UploadFile] = File(...), user=Depends(admin_
     return {"added": added}
 
 @app.get("/api/admin/photos")
-def admin_photos(user=Depends(admin_user)):
+def admin_photos(user=Depends(current_user)):
     db = get_db()
     rows = db.execute("""
         SELECT p.*, COUNT(r.id) as vote_count
@@ -1006,7 +1504,7 @@ def admin_photos(user=Depends(admin_user)):
     db.close(); return [dict(r) for r in rows]
 
 @app.delete("/api/admin/photos/{pid}")
-def delete_photo(pid: int, user=Depends(admin_user)):
+def delete_photo(pid: int, user=Depends(current_user)):
     db = get_db()
     row = db.execute("SELECT filename FROM photos WHERE id=?", (pid,)).fetchone()
     if row:
@@ -1019,7 +1517,7 @@ def delete_photo(pid: int, user=Depends(admin_user)):
     db.close(); return {"ok": True}
 
 @app.get("/api/admin/duplicate-photos")
-def find_duplicate_photos(user=Depends(admin_user)):
+def find_duplicate_photos(user=Depends(current_user)):
     """
     Находит фото с одинаковым original_name — обычно следствие гонки при
     параллельном запуске синхронизации (см. merge_duplicate_photos). Не
@@ -1039,7 +1537,7 @@ def find_duplicate_photos(user=Depends(admin_user)):
     }
 
 @app.post("/api/admin/duplicate-photos/merge")
-def merge_duplicate_photos(user=Depends(admin_user)):
+def merge_duplicate_photos(user=Depends(current_user)):
     """
     Объединяет дубли (фото с одинаковым original_name, обычно из-за гонки
     при параллельном запуске авто-синхронизации до того, как в коде
@@ -1062,13 +1560,21 @@ def merge_duplicate_photos(user=Depends(admin_user)):
         remove_ids = ids[1:]
 
         for rid in remove_ids:
-            # переносим голоса и теги, которых ещё нет у keep_id (не теряем чужие оценки)
-            for r in db.execute("SELECT user_id, tier_id FROM ratings WHERE photo_id=?", (rid,)).fetchall():
-                db.execute("INSERT OR IGNORE INTO ratings (photo_id, user_id, tier_id) VALUES (?,?,?)",
-                           (keep_id, r["user_id"], r["tier_id"]))
+            # переносим голоса и теги, которых ещё нет у keep_id (не теряем чужие оценки).
+            # Голоса переносим по сессиям отдельно — UNIQUE теперь (session_id, photo_id, user_id).
+            for r in db.execute("SELECT session_id, user_id, tier_id FROM ratings WHERE photo_id=?", (rid,)).fetchall():
+                db.execute("INSERT OR IGNORE INTO ratings (session_id, photo_id, user_id, tier_id) VALUES (?,?,?,?)",
+                           (r["session_id"], keep_id, r["user_id"], r["tier_id"]))
             for t in db.execute("SELECT user_id, tag_id, is_suggestion FROM photo_tags WHERE photo_id=?", (rid,)).fetchall():
                 db.execute("INSERT OR IGNORE INTO photo_tags (photo_id, user_id, tag_id, is_suggestion) VALUES (?,?,?,?)",
                            (keep_id, t["user_id"], t["tag_id"], t["is_suggestion"]))
+            # session_photos: если оба фото (keep и rid) оказались в одной и той же
+            # сессии — оставляем позицию keep, иначе переносим запись с rid на keep.
+            for sp in db.execute("SELECT session_id FROM session_photos WHERE photo_id=?", (rid,)).fetchall():
+                db.execute("INSERT OR IGNORE INTO session_photos (session_id, photo_id, position) "
+                           "SELECT session_id, ?, position FROM session_photos WHERE session_id=? AND photo_id=?",
+                           (keep_id, sp["session_id"], rid))
+                db.execute("DELETE FROM session_photos WHERE session_id=? AND photo_id=?", (sp["session_id"], rid))
 
             row = db.execute("SELECT filename FROM photos WHERE id=?", (rid,)).fetchone()
             if row:
@@ -1088,43 +1594,55 @@ def merge_duplicate_photos(user=Depends(admin_user)):
 
 # ── VOTING ────────────────────────────────────────────────────────────────────
 
-@app.get("/api/current-photo")
-def current_photo(user=Depends(current_user)):
+@app.get("/api/sessions/{session_id}/current-photo")
+def current_photo(session_id: int, user=Depends(current_user)):
     db = get_db()
-    photo_id = get_setting(db, "current_photo_id")
-    voting_open = get_setting(db, "voting_open")
-    tiers = get_tiers(db)
+    session = get_session_or_404(db, session_id)
+    photo_id = session["current_photo_id"]
+    voting_open = bool(session["voting_open"])
+    tiers = get_tiers_for_session(session)
     if not photo_id:
         db.close()
-        return {"photo": None, "voting_open": voting_open=="1", "tiers": tiers}
+        return {"photo": None, "voting_open": voting_open, "tiers": tiers}
     row = db.execute("""
         SELECT p.*, COUNT(r.id) as vote_count
-        FROM photos p LEFT JOIN ratings r ON r.photo_id=p.id
+        FROM photos p LEFT JOIN ratings r ON r.photo_id=p.id AND r.session_id=?
         WHERE p.id=? GROUP BY p.id
-    """, (photo_id,)).fetchone()
+    """, (session_id, photo_id)).fetchone()
     user_rating = db.execute(
-        "SELECT tier_id FROM ratings WHERE photo_id=? AND user_id=?",
-        (photo_id, user["id"])).fetchone()
+        "SELECT tier_id FROM ratings WHERE session_id=? AND photo_id=? AND user_id=?",
+        (session_id, photo_id, user["id"])).fetchone()
     # per-tier counts
     tier_counts = {}
-    for r in db.execute("SELECT tier_id, COUNT(*) as cnt FROM ratings WHERE photo_id=? GROUP BY tier_id", (photo_id,)).fetchall():
+    for r in db.execute(
+        "SELECT tier_id, COUNT(*) as cnt FROM ratings WHERE session_id=? AND photo_id=? GROUP BY tier_id",
+        (session_id, photo_id)).fetchall():
         tier_counts[r["tier_id"]] = r["cnt"]
-    total_users = db.execute("SELECT COUNT(*) FROM users WHERE is_admin=0 AND is_system=0").fetchone()[0]
-    auto_advance = get_setting(db, "auto_advance") == "1"
+    # "Сколько людей сейчас в сессии" — считаем по живым WS-подключениям к
+    # этой конкретной сессии (исключая создателя как "админа сессии" не делаем —
+    # он тоже участник, как и в исходном глобальном режиме админ тоже голосовал).
+    total_users = len(ws_manager.online_user_ids(session_id))
+    auto_advance = bool(session["auto_advance"])
 
-    # ── следующее/предыдущее фото (для предзагрузки в кэш на фронтенде) ───────
-    next_row = db.execute(
-        "SELECT filename FROM photos WHERE position>(SELECT position FROM photos WHERE id=?) ORDER BY position LIMIT 1",
-        (photo_id,)).fetchone()
-    prev_row = db.execute(
-        "SELECT filename FROM photos WHERE position<(SELECT position FROM photos WHERE id=?) ORDER BY position DESC LIMIT 1",
-        (photo_id,)).fetchone()
+    # ── следующее/предыдущее фото в порядке ЭТОЙ сессии (для предзагрузки в кэш) ──
+    next_row = db.execute("""
+        SELECT p.filename FROM session_photos sp JOIN photos p ON p.id = sp.photo_id
+        WHERE sp.session_id=? AND sp.position > (
+            SELECT position FROM session_photos WHERE session_id=? AND photo_id=?
+        ) ORDER BY sp.position LIMIT 1
+    """, (session_id, session_id, photo_id)).fetchone()
+    prev_row = db.execute("""
+        SELECT p.filename FROM session_photos sp JOIN photos p ON p.id = sp.photo_id
+        WHERE sp.session_id=? AND sp.position < (
+            SELECT position FROM session_photos WHERE session_id=? AND photo_id=?
+        ) ORDER BY sp.position DESC LIMIT 1
+    """, (session_id, session_id, photo_id)).fetchone()
 
     db.close()
     return {
         "photo": dict(row) if row else None,
         "user_tier": user_rating["tier_id"] if user_rating else None,
-        "voting_open": voting_open == "1",
+        "voting_open": voting_open,
         "total_users": total_users,
         "tiers": tiers,
         "tier_counts": tier_counts,
@@ -1133,31 +1651,34 @@ def current_photo(user=Depends(current_user)):
         "prev_filename": prev_row["filename"] if prev_row else None,
     }
 
-@app.post("/api/rate")
-async def rate_photo(photo_id: int = Form(...), tier_id: str = Form(...), user=Depends(current_user)):
+@app.post("/api/sessions/{session_id}/rate")
+async def rate_photo(session_id: int, photo_id: int = Form(...), tier_id: str = Form(...), user=Depends(current_user)):
     db = get_db()
-    tiers = get_tiers(db)
+    session = get_session_or_404(db, session_id)
+    tiers = get_tiers_for_session(session)
     valid_ids = {t["id"] for t in tiers}
     if tier_id not in valid_ids:
         db.close(); raise HTTPException(400, "Invalid tier")
-    if get_setting(db, "voting_open") != "1":
+    if not session["voting_open"]:
         db.close(); raise HTTPException(403, "Voting is closed")
-    if str(photo_id) != str(get_setting(db, "current_photo_id")):
+    if photo_id != session["current_photo_id"]:
         db.close(); raise HTTPException(400, "Not the current photo")
     db.execute("""
-        INSERT INTO ratings (photo_id, user_id, tier_id) VALUES (?,?,?)
-        ON CONFLICT(photo_id, user_id) DO UPDATE SET tier_id=excluded.tier_id
-    """, (photo_id, user["id"], tier_id))
+        INSERT INTO ratings (session_id, photo_id, user_id, tier_id) VALUES (?,?,?,?)
+        ON CONFLICT(session_id, photo_id, user_id) DO UPDATE SET tier_id=excluded.tier_id
+    """, (session_id, photo_id, user["id"], tier_id))
     db.commit()
 
     # ── AUTO-ADVANCE CHECK ────────────────────────────────────────────────────
-    auto_advance = get_setting(db, "auto_advance") == "1"
+    auto_advance = bool(session["auto_advance"])
     if auto_advance:
-        online_ids = ws_manager.online_user_ids()
-        # Только не-админы считаются «участниками»
+        online_ids = ws_manager.online_user_ids(session_id)
+        # Только не-админы считаются «участниками» (создатель сессии тоже может
+        # голосовать как обычный участник — это не отличается от глобального
+        # режима, где обычный сайт-админ тоже мог голосовать)
         non_admin_online = set(
             r["id"] for r in db.execute(
-                "SELECT id FROM users WHERE is_admin=0 AND is_system=0 AND id IN ({})".format(
+                "SELECT id FROM users WHERE is_system=0 AND id IN ({})".format(
                     ",".join("?" * len(online_ids)) if online_ids else "NULL"
                 ), tuple(online_ids)
             ).fetchall()
@@ -1166,30 +1687,36 @@ async def rate_photo(photo_id: int = Form(...), tier_id: str = Form(...), user=D
         if non_admin_online:
             voted_ids = set(
                 r["user_id"] for r in db.execute(
-                    "SELECT user_id FROM ratings WHERE photo_id=?", (photo_id,)
+                    "SELECT user_id FROM ratings WHERE session_id=? AND photo_id=?", (session_id, photo_id)
                 ).fetchall()
             )
             all_voted = non_admin_online.issubset(voted_ids)
             if all_voted:
-                # Переходим к следующему фото
-                nxt = db.execute(
-                    "SELECT id FROM photos WHERE position>(SELECT position FROM photos WHERE id=?) ORDER BY position LIMIT 1",
-                    (photo_id,)
-                ).fetchone()
+                # Переходим к следующему фото в порядке этой сессии
+                nxt = db.execute("""
+                    SELECT sp.photo_id as id FROM session_photos sp
+                    WHERE sp.session_id=? AND sp.position > (
+                        SELECT position FROM session_photos WHERE session_id=? AND photo_id=?
+                    ) ORDER BY sp.position LIMIT 1
+                """, (session_id, session_id, photo_id)).fetchone()
                 if nxt:
-                    set_setting(db, "current_photo_id", str(nxt["id"]))
-                    set_setting(db, "voting_open", "1")
+                    db.execute("UPDATE sessions SET current_photo_id=?, voting_open=1 WHERE id=?",
+                               (nxt["id"], session_id))
+                    db.commit()
                     db.close()
-                    await ws_manager.broadcast({"type": "photo_change", "photo_id": nxt["id"], "auto": True, "direction": "next"})
+                    await ws_manager.broadcast(
+                        {"type": "photo_change", "photo_id": nxt["id"], "auto": True, "direction": "next"},
+                        session_id
+                    )
                     return {"ok": True, "auto_advanced": True}
                 else:
                     # Все фото просмотрены
                     db.close()
-                    await ws_manager.broadcast({"type": "all_done"})
+                    await ws_manager.broadcast({"type": "all_done"}, session_id)
                     return {"ok": True, "auto_advanced": True}
 
     db.close()
-    await ws_manager.broadcast({"type": "vote_update", "photo_id": photo_id})
+    await ws_manager.broadcast({"type": "vote_update", "photo_id": photo_id}, session_id)
     return {"ok": True}
 
 
@@ -1285,17 +1812,18 @@ def remove_photo_tag(photo_id: int, tag_id: int, user=Depends(current_user)):
     db.commit(); db.close()
     return {"ok": True}
 
-@app.get("/api/photo-votes/{photo_id}")
-def photo_votes(photo_id: int, user=Depends(current_user)):
+@app.get("/api/sessions/{session_id}/photo-votes/{photo_id}")
+def photo_votes(session_id: int, photo_id: int, user=Depends(current_user)):
     db = get_db()
-    tiers = get_tiers(db)
+    session = get_session_or_404(db, session_id)
+    tiers = get_tiers_for_session(session)
     tier_map = {t["id"]: t for t in tiers}
     rows = db.execute("""
         SELECT u.username, r.tier_id, r.created_at
         FROM ratings r JOIN users u ON u.id = r.user_id
-        WHERE r.photo_id = ?
+        WHERE r.session_id = ? AND r.photo_id = ?
         ORDER BY r.created_at DESC
-    """, (photo_id,)).fetchall()
+    """, (session_id, photo_id)).fetchall()
     db.close()
     return [{"username": r["username"], "tier_id": r["tier_id"],
              "tier_label": tier_map.get(r["tier_id"], {}).get("label", r["tier_id"]),
@@ -1303,10 +1831,11 @@ def photo_votes(photo_id: int, user=Depends(current_user)):
              "created_at": r["created_at"]} for r in rows]
 
 
-@app.get("/api/photo-detail/{photo_id}")
-def photo_detail(photo_id: int, user=Depends(current_user)):
+@app.get("/api/sessions/{session_id}/photo-detail/{photo_id}")
+def photo_detail(session_id: int, photo_id: int, user=Depends(current_user)):
     db = get_db()
-    tiers = get_tiers(db)
+    session = get_session_or_404(db, session_id)
+    tiers = get_tiers_for_session(session)
     tier_map = {t["id"]: t for t in tiers}
 
     # photo info
@@ -1314,14 +1843,15 @@ def photo_detail(photo_id: int, user=Depends(current_user)):
     if not photo:
         db.close(); raise HTTPException(404)
 
-    # votes per user
+    # votes per user (в рамках этой сессии)
     votes = db.execute("""
         SELECT u.username, r.tier_id
         FROM ratings r JOIN users u ON u.id=r.user_id
-        WHERE r.photo_id=? ORDER BY u.username
-    """, (photo_id,)).fetchall()
+        WHERE r.session_id=? AND r.photo_id=? ORDER BY u.username
+    """, (session_id, photo_id)).fetchall()
 
-    # tags with user counts (только подтверждённые — suggestion'ы сюда не попадают)
+    # tags with user counts (теги общие для фото, не зависят от сессии;
+    # только подтверждённые — suggestion'ы сюда не попадают)
     tags = db.execute("""
         SELECT t.name, COUNT(pt.user_id) as cnt,
                GROUP_CONCAT(u.username, ', ') as users
@@ -1344,87 +1874,127 @@ def photo_detail(photo_id: int, user=Depends(current_user)):
 
 # ── ADMIN NAV ─────────────────────────────────────────────────────────────────
 
-@app.post("/api/admin/next-photo")
-async def next_photo(user=Depends(admin_user)):
-    db = get_db(); cur = get_setting(db, "current_photo_id")
-    nxt = db.execute(
-        "SELECT id FROM photos WHERE position>(SELECT position FROM photos WHERE id=?) ORDER BY position LIMIT 1",
-        (cur,)).fetchone() if cur else db.execute("SELECT id FROM photos ORDER BY position LIMIT 1").fetchone()
-    if not nxt: db.close(); return {"done": True}
-    set_setting(db, "current_photo_id", str(nxt["id"]))
-    set_setting(db, "voting_open", "1")
-    db.close()
-    await ws_manager.broadcast({"type": "photo_change", "photo_id": nxt["id"], "direction": "next"})
-    return {"done": False, "photo_id": nxt["id"]}
+def require_session_owner(db, session_id: int, user) -> sqlite3.Row:
+    """Возвращает сессию, если вызывающий — её создатель (или сайт-админ),
+    иначе бросает 403. Используется во всех управляющих сессией endpoint'ах
+    (next/prev/set photo, shuffle, close-voting, auto-advance, tiers)."""
+    session = get_session_or_404(db, session_id)
+    if session["creator_user_id"] != user["id"] and not user["is_admin"]:
+        db.close()
+        raise HTTPException(403, "Управлять сессией может только её создатель")
+    return session
 
-@app.post("/api/admin/prev-photo")
-async def prev_photo(user=Depends(admin_user)):
-    db = get_db(); cur = get_setting(db, "current_photo_id")
-    if not cur: raise HTTPException(400, "No current photo")
-    prev = db.execute(
-        "SELECT id FROM photos WHERE position<(SELECT position FROM photos WHERE id=?) ORDER BY position DESC LIMIT 1",
-        (cur,)).fetchone()
-    if not prev: raise HTTPException(400, "Already at first photo")
-    set_setting(db, "current_photo_id", str(prev["id"]))
-    set_setting(db, "voting_open", "1")
-    db.close()
-    await ws_manager.broadcast({"type": "photo_change", "photo_id": prev["id"], "direction": "prev"})
-    return {"photo_id": prev["id"]}
-
-@app.post("/api/admin/set-photo/{pid}")
-async def set_photo(pid: int, user=Depends(admin_user)):
+@app.post("/api/sessions/{session_id}/next-photo")
+async def next_photo(session_id: int, user=Depends(current_user)):
     db = get_db()
-    if not db.execute("SELECT id FROM photos WHERE id=?", (pid,)).fetchone(): raise HTTPException(404)
-    set_setting(db, "current_photo_id", str(pid))
-    set_setting(db, "voting_open", "1")
-    db.close()
-    await ws_manager.broadcast({"type": "photo_change", "photo_id": pid})
-    return {"ok": True}
-
-
-@app.post("/api/admin/shuffle")
-async def shuffle_photos(user=Depends(admin_user)):
-    """Перемешивает порядок фотографий случайно."""
-    import random
-    db = get_db()
-    ids = [r["id"] for r in db.execute("SELECT id FROM photos").fetchall()]
-    random.shuffle(ids)
-    for new_pos, pid in enumerate(ids):
-        db.execute("UPDATE photos SET position=? WHERE id=?", (new_pos, pid))
-    # перейти на первое фото в новом порядке
-    first = db.execute("SELECT id FROM photos ORDER BY position LIMIT 1").fetchone()
-    if first:
-        set_setting(db, "current_photo_id", str(first["id"]))
-        set_setting(db, "voting_open", "1")
+    session = require_session_owner(db, session_id, user)
+    cur = session["current_photo_id"]
+    nxt = db.execute("""
+        SELECT sp.photo_id as id FROM session_photos sp
+        WHERE sp.session_id=? AND sp.position > (
+            SELECT position FROM session_photos WHERE session_id=? AND photo_id=?
+        ) ORDER BY sp.position LIMIT 1
+    """, (session_id, session_id, cur)).fetchone() if cur else db.execute(
+        "SELECT photo_id as id FROM session_photos WHERE session_id=? ORDER BY position LIMIT 1", (session_id,)
+    ).fetchone()
+    if not nxt:
+        db.close()
+        return {"done": True}
+    db.execute("UPDATE sessions SET current_photo_id=?, voting_open=1 WHERE id=?", (nxt["id"], session_id))
     db.commit()
     db.close()
-    if first:
-        await ws_manager.broadcast({"type": "photo_change", "photo_id": first["id"]})
-    return {"ok": True, "count": len(ids), "first_id": first["id"] if first else None}
+    await ws_manager.broadcast({"type": "photo_change", "photo_id": nxt["id"], "direction": "next"}, session_id)
+    return {"done": False, "photo_id": nxt["id"]}
 
-@app.post("/api/admin/close-voting")
-async def close_voting(user=Depends(admin_user)):
-    db = get_db(); set_setting(db, "voting_open", "0"); db.close()
-    await ws_manager.broadcast({"type": "voting_closed"})
+@app.post("/api/sessions/{session_id}/prev-photo")
+async def prev_photo(session_id: int, user=Depends(current_user)):
+    db = get_db()
+    session = require_session_owner(db, session_id, user)
+    cur = session["current_photo_id"]
+    if not cur:
+        db.close()
+        raise HTTPException(400, "No current photo")
+    prev = db.execute("""
+        SELECT sp.photo_id as id FROM session_photos sp
+        WHERE sp.session_id=? AND sp.position < (
+            SELECT position FROM session_photos WHERE session_id=? AND photo_id=?
+        ) ORDER BY sp.position DESC LIMIT 1
+    """, (session_id, session_id, cur)).fetchone()
+    if not prev:
+        db.close()
+        raise HTTPException(400, "Already at first photo")
+    db.execute("UPDATE sessions SET current_photo_id=?, voting_open=1 WHERE id=?", (prev["id"], session_id))
+    db.commit()
+    db.close()
+    await ws_manager.broadcast({"type": "photo_change", "photo_id": prev["id"], "direction": "prev"}, session_id)
+    return {"photo_id": prev["id"]}
+
+@app.post("/api/sessions/{session_id}/set-photo/{pid}")
+async def set_photo(session_id: int, pid: int, user=Depends(current_user)):
+    db = get_db()
+    require_session_owner(db, session_id, user)
+    if not db.execute("SELECT 1 FROM session_photos WHERE session_id=? AND photo_id=?", (session_id, pid)).fetchone():
+        db.close()
+        raise HTTPException(404, "Это фото не входит в данную сессию")
+    db.execute("UPDATE sessions SET current_photo_id=?, voting_open=1 WHERE id=?", (pid, session_id))
+    db.commit()
+    db.close()
+    await ws_manager.broadcast({"type": "photo_change", "photo_id": pid}, session_id)
     return {"ok": True}
 
-@app.post("/api/admin/auto-advance")
-async def set_auto_advance(enabled: bool = Form(...), user=Depends(admin_user)):
+
+@app.post("/api/sessions/{session_id}/shuffle")
+async def shuffle_photos(session_id: int, user=Depends(current_user)):
+    """Перемешивает порядок фотографий случайно — только внутри этой сессии,
+    не затрагивает другие параллельные сессии и глобальный порядок photos."""
+    import random
     db = get_db()
-    set_setting(db, "auto_advance", "1" if enabled else "0")
+    require_session_owner(db, session_id, user)
+    ids = [r["photo_id"] for r in db.execute(
+        "SELECT photo_id FROM session_photos WHERE session_id=?", (session_id,)
+    ).fetchall()]
+    random.shuffle(ids)
+    for new_pos, pid in enumerate(ids):
+        db.execute("UPDATE session_photos SET position=? WHERE session_id=? AND photo_id=?",
+                   (new_pos, session_id, pid))
+    first_id = ids[0] if ids else None
+    if first_id:
+        db.execute("UPDATE sessions SET current_photo_id=?, voting_open=1 WHERE id=?", (first_id, session_id))
+    db.commit()
     db.close()
-    await ws_manager.broadcast({"type": "auto_advance_changed", "enabled": enabled})
+    if first_id:
+        await ws_manager.broadcast({"type": "photo_change", "photo_id": first_id}, session_id)
+    return {"ok": True, "count": len(ids), "first_id": first_id}
+
+@app.post("/api/sessions/{session_id}/close-voting")
+async def close_voting(session_id: int, user=Depends(current_user)):
+    db = get_db()
+    require_session_owner(db, session_id, user)
+    db.execute("UPDATE sessions SET voting_open=0 WHERE id=?", (session_id,))
+    db.commit()
+    db.close()
+    await ws_manager.broadcast({"type": "voting_closed"}, session_id)
+    return {"ok": True}
+
+@app.post("/api/sessions/{session_id}/auto-advance")
+async def set_auto_advance(session_id: int, enabled: bool = Form(...), user=Depends(current_user)):
+    db = get_db()
+    require_session_owner(db, session_id, user)
+    db.execute("UPDATE sessions SET auto_advance=? WHERE id=?", (1 if enabled else 0, session_id))
+    db.commit()
+    db.close()
+    await ws_manager.broadcast({"type": "auto_advance_changed", "enabled": enabled}, session_id)
     return {"enabled": enabled}
 
-@app.get("/api/admin/auto-advance")
-def get_auto_advance(user=Depends(admin_user)):
+@app.get("/api/sessions/{session_id}/auto-advance")
+def get_auto_advance(session_id: int, user=Depends(current_user)):
     db = get_db()
-    val = get_setting(db, "auto_advance") == "1"
+    session = get_session_or_404(db, session_id)
     db.close()
-    return {"enabled": val}
+    return {"enabled": bool(session["auto_advance"])}
 
 @app.get("/api/admin/wd14-status")
-def get_wd14_status(user=Depends(admin_user)):
+def get_wd14_status(user=Depends(current_user)):
     """
     Статус автотегирования для админ-панели: проверяет не только наличие
     файлов модели, но и их реальный размер (см. wd14_tagger.is_available) —
@@ -1447,15 +2017,15 @@ def get_wd14_status(user=Depends(admin_user)):
         "tags_size_bytes": tags_size,
     }
 
-@app.get("/api/online-users")
-def online_users(user=Depends(current_user)):
-    """Возвращает список онлайн-пользователей (не-админов)."""
-    online_ids = ws_manager.online_user_ids()
+@app.get("/api/sessions/{session_id}/online-users")
+def online_users(session_id: int, user=Depends(current_user)):
+    """Возвращает список онлайн-пользователей именно в этой сессии."""
+    online_ids = ws_manager.online_user_ids(session_id)
     if not online_ids:
         return {"count": 0, "users": []}
     db = get_db()
     rows = db.execute(
-        "SELECT id, username FROM users WHERE is_admin=0 AND is_system=0 AND id IN ({})".format(
+        "SELECT id, username FROM users WHERE is_system=0 AND id IN ({})".format(
             ",".join("?" * len(online_ids))
         ), tuple(online_ids)
     ).fetchall()
@@ -1464,94 +2034,136 @@ def online_users(user=Depends(current_user)):
 
 # ── TIERLIST ──────────────────────────────────────────────────────────────────
 
-@app.get("/api/tierlist/tags")
-def tierlist_tags(user=Depends(current_user)):
-    """Возвращает все подтверждённые теги, которые есть хотя бы у одного оценённого фото."""
+@app.get("/api/photos/random-preview")
+def random_photo_preview(user=Depends(current_user)):
+    """
+    Одно случайное фото из общего пула — для обложки плитки "Все фото" в
+    форме создания сессии (по аналогии с тем, как альбом "Все фото" в
+    галерее телефона показывает превью одного из снимков). Лёгкий запрос,
+    не тянет весь список фото, как /api/admin/photos.
+    """
     db = get_db()
-    rows = db.execute("""
-        SELECT DISTINCT t.id, t.name
+    row = db.execute("SELECT filename FROM photos ORDER BY RANDOM() LIMIT 1").fetchone()
+    db.close()
+    return {"filename": row["filename"] if row else None}
+
+@app.get("/api/tierlist/tags")
+def tierlist_tags(include_suggestions: bool = False, q: str = "", user=Depends(current_user)):
+    """
+    Возвращает теги для формы СОЗДАНИЯ сессии — отдельных альбомов-карточек.
+    Список не зависит от конкретной сессии, теги общие атрибуты фото.
+
+    Без поискового запроса (q=""): топ-10 самых популярных тегов (по числу
+        фото) — витрина для дефолтного показа сетки альбомов.
+    С поисковым запросом (q="..."): ищет по ВСЕМ тегам сайта, у которых есть
+        хотя бы одно подходящее фото — без ограничения в 10, чтобы поиск не
+        был "слепым" к тегам за пределами топ-10 витрины.
+
+    include_suggestions=False (по умолчанию): считаются и показываются
+        только теги с хотя бы одним ПОДТВЕРЖДЁННЫМ фото — неподтверждённые
+        AI-предложения не видны вообще, пока человек явно не попросит их
+        показать.
+    include_suggestions=True: учитываются также фото, у которых тег есть
+        только как неподтверждённое AI-предложение.
+
+    Для каждого тега возвращаем:
+      - has_confirmed: есть ли хотя бы одно ПОДТВЕРЖДЁННОЕ фото (для пометки
+        "только AI" у тегов, которые пока никто не подтвердил)
+      - preview_filename: имя файла одного репрезентативного фото — для
+        карточки-обложки тега в UI
+      - is_favorite: входит ли тег в любимые теги текущего пользователя
+        (по высоко оценённым им фото во всех его сессиях) — такие теги
+        отдаются первыми в списке.
+    """
+    db = get_db()
+
+    suggestion_clause = "" if include_suggestions else "AND pt.is_suggestion = 0"
+    q = q.strip()
+    if q:
+        pattern = "%" + q.replace("%", "").replace("_", "\\_") + "%"
+        name_clause = "AND t.name LIKE ? ESCAPE '\\'"
+        params = [pattern]
+        limit_clause = "LIMIT 50"
+    else:
+        name_clause = ""
+        params = []
+        limit_clause = ""
+
+    rows = db.execute(f"""
+        SELECT t.id, t.name,
+               COUNT(DISTINCT pt.photo_id) as photo_count,
+               MAX(CASE WHEN pt.is_suggestion = 0 THEN 1 ELSE 0 END) as has_confirmed
         FROM tags t
         JOIN photo_tags pt ON pt.tag_id = t.id
-        JOIN ratings r ON r.photo_id = pt.photo_id
-        WHERE pt.is_suggestion = 0
-        ORDER BY t.name
+        WHERE 1=1 {suggestion_clause} {name_clause}
+        GROUP BY t.id
+        HAVING photo_count > 0
+        ORDER BY photo_count DESC
+        {limit_clause}
+    """, params).fetchall()
+
+    favorite_ids = set(get_favorite_tag_ids_for_user(db, user["id"]))
+
+    # Один батч-запрос превью для всех тегов сразу (вместо N отдельных) —
+    # для каждого tag_id берём filename одного фото, предпочитая подтверждённое.
+    preview_rows = db.execute("""
+        SELECT pt.tag_id, p.filename, pt.is_suggestion
+        FROM photo_tags pt JOIN photos p ON p.id = pt.photo_id
+        ORDER BY pt.tag_id, pt.is_suggestion ASC
     """).fetchall()
+    preview_by_tag = {}
+    for pr in preview_rows:
+        preview_by_tag.setdefault(pr["tag_id"], pr["filename"])  # первое вхождение на tag_id — уже отсортировано
+
+    result = []
+    for r in rows:
+        result.append({
+            "id": r["id"], "name": r["name"],
+            "photo_count": r["photo_count"],
+            "has_confirmed": bool(r["has_confirmed"]),
+            "preview_filename": preview_by_tag.get(r["id"]),
+            "is_favorite": r["id"] in favorite_ids,
+        })
+
     db.close()
-    return [{"id": r["id"], "name": r["name"]} for r in rows]
+    # Сначала любимые (по убыванию популярности среди них), затем остальные
+    # по убыванию популярности. Лимит — 10 карточек суммарно, чтобы список
+    # не превращался в бесконечную простыню тегов от WD14.
+    result.sort(key=lambda t: (not t["is_favorite"], -t["photo_count"]))
+    return result if q else result[:10]
 
 
-@app.get("/api/tierlist")
-def tierlist(tag_ids: str = "", exclude_tag_ids: str = "", user=Depends(current_user)):
+def compute_session_tierlist(db, session_id: int, session_row=None):
     """
-    tag_ids — список id тегов через запятую для включения (фото должны иметь ВСЕ).
-    exclude_tag_ids — список id тегов через запятую для исключения (фото не должны иметь НИ ОДНОГО).
+    Считает тир-лист сессии по голосам (ratings) — общая логика, используемая
+    и в обычном GET /api/sessions/{id}/tierlist, и при публикации статичного
+    снимка на главную страницу (см. publish_tierlist_snapshot). Принимает уже
+    открытое соединение db, ничего не закрывает сама.
     """
-    db = get_db()
-    tiers = get_tiers(db)
+    session = session_row or get_session_or_404(db, session_id)
+    tiers = get_tiers_for_session(session)
     tier_order = [t["id"] for t in tiers]
     tier_map = {t["id"]: t for t in tiers}
 
     n = len(tiers)
     tier_score = {t["id"]: n - i for i, t in enumerate(tiers)}
 
-    # parse include filter
-    selected_tag_ids = []
-    if tag_ids.strip():
-        try:
-            selected_tag_ids = [int(x) for x in tag_ids.split(",") if x.strip()]
-        except ValueError:
-            pass
-
-    # parse exclude filter
-    excluded_tag_ids = []
-    if exclude_tag_ids.strip():
-        try:
-            excluded_tag_ids = [int(x) for x in exclude_tag_ids.split(",") if x.strip()]
-        except ValueError:
-            pass
-
-    # build allowed_ids from include filter
-    if selected_tag_ids:
-        placeholders = ",".join("?" * len(selected_tag_ids))
-        filtered_ids = db.execute(f"""
-            SELECT photo_id
-            FROM photo_tags
-            WHERE tag_id IN ({placeholders}) AND is_suggestion = 0
-            GROUP BY photo_id
-            HAVING COUNT(DISTINCT tag_id) = {len(selected_tag_ids)}
-        """, selected_tag_ids).fetchall()
-        allowed_ids = {r["photo_id"] for r in filtered_ids}
-    else:
-        # all rated photos
-        all_rated = db.execute("SELECT DISTINCT photo_id FROM ratings").fetchall()
-        allowed_ids = {r["photo_id"] for r in all_rated}
-
-    # apply exclude filter — remove photos that have ANY of the excluded tags
-    if excluded_tag_ids and allowed_ids:
-        excl_placeholders = ",".join("?" * len(excluded_tag_ids))
-        excl_rows = db.execute(f"""
-            SELECT DISTINCT photo_id
-            FROM photo_tags
-            WHERE tag_id IN ({excl_placeholders}) AND is_suggestion = 0
-        """, excluded_tag_ids).fetchall()
-        excl_photo_ids = {r["photo_id"] for r in excl_rows}
-        allowed_ids -= excl_photo_ids
+    allowed_ids = {r["photo_id"] for r in db.execute(
+        "SELECT DISTINCT photo_id FROM ratings WHERE session_id=?", (session_id,)
+    ).fetchall()}
 
     if not allowed_ids:
-        db.close()
         return {"tiers": {tid: [] for tid in tier_order},
-                "tier_order": tier_order, "tier_map": tier_map,
-                "active_tag_ids": selected_tag_ids,
-                "excluded_tag_ids": excluded_tag_ids}
+                "tier_order": tier_order, "tier_map": tier_map}
 
     id_placeholders = ",".join("?" * len(allowed_ids))
     rows = db.execute(f"""
         SELECT p.id, p.filename, p.original_name,
                r.tier_id, COUNT(*) as cnt
         FROM ratings r JOIN photos p ON p.id=r.photo_id
-        WHERE p.id IN ({id_placeholders})
+        WHERE r.session_id=? AND p.id IN ({id_placeholders})
         GROUP BY p.id, r.tier_id
-    """, list(allowed_ids)).fetchall()
+    """, [session_id] + list(allowed_ids)).fetchall()
 
     from collections import defaultdict
     photo_info = {}
@@ -1578,24 +2190,41 @@ def tierlist(tag_ids: str = "", exclude_tag_ids: str = "", user=Depends(current_
     for tid in result:
         result[tid].sort(key=lambda x: -x["avg_score"])
 
+    return {"tiers": result, "tier_order": tier_order, "tier_map": tier_map}
+
+@app.get("/api/sessions/{session_id}/tierlist")
+def tierlist(session_id: int, user=Depends(current_user)):
+    """
+    Тир-лист конкретной сессии: считается по голосам (ratings) этой сессии,
+    с тирами, заданными при её создании. Список фото фиксирован при создании
+    сессии (см. /api/sessions создание) — повторная фильтрация по тегам внутри
+    уже идущей сессии не нужна.
+    """
+    db = get_db()
+    result = compute_session_tierlist(db, session_id)
     db.close()
-    return {"tiers": result, "tier_order": tier_order, "tier_map": tier_map,
-            "active_tag_ids": selected_tag_ids,
-            "excluded_tag_ids": excluded_tag_ids}
+    return result
 
 @app.get("/api/stats")
-def stats(user=Depends(admin_user)):
+def stats(user=Depends(current_user)):
     db = get_db()
     r = {
         "total_photos": db.execute("SELECT COUNT(*) FROM photos").fetchone()[0],
         "rated_photos": db.execute("SELECT COUNT(DISTINCT photo_id) FROM ratings").fetchone()[0],
         "total_users": db.execute("SELECT COUNT(*) FROM users WHERE is_admin=0 AND is_system=0").fetchone()[0],
         "total_votes": db.execute("SELECT COUNT(*) FROM ratings").fetchone()[0],
+        "active_sessions": db.execute("SELECT COUNT(*) FROM sessions WHERE is_active=1").fetchone()[0],
     }
     db.close(); return r
 
 @app.post("/api/admin/reset-db")
 def reset_db(user=Depends(admin_user)):
+    """
+    Полный сброс сайта: удаляет всех обычных пользователей, все фото с диска,
+    все голоса, теги и ВСЕ сессии (включая активные). Это разрушительная
+    операция уровня всего сайта — доступна только сайт-админу, не владельцам
+    отдельных сессий (для завершения своей сессии есть /api/sessions/{id}/end).
+    """
     db = get_db()
     # delete all non-admin users
     db.execute("DELETE FROM users WHERE is_admin=0 AND is_system=0")
@@ -1607,8 +2236,8 @@ def reset_db(user=Depends(admin_user)):
     db.execute("DELETE FROM photos")
     db.execute("DELETE FROM ratings")
     db.execute("DELETE FROM photo_tags")
-    db.execute("UPDATE settings SET value=NULL WHERE key='current_photo_id'")
-    db.execute("UPDATE settings SET value='1' WHERE key='voting_open'")
+    db.execute("DELETE FROM session_photos")
+    db.execute("DELETE FROM sessions")
     db.commit()
     db.close()
     return {"ok": True}
@@ -1625,23 +2254,28 @@ def make_admin_user(uid: int, user=Depends(admin_user)):
     return {"ok": True}
 
 
-@app.get("/api/users-list")
-def users_list(user=Depends(current_user)):
+@app.get("/api/sessions/{session_id}/users-list")
+def users_list(session_id: int, user=Depends(current_user)):
+    """Участники именно этой сессии (у кого есть хоть один голос в ней) —
+    для боковой панели экрана 'Статистика'."""
     db = get_db()
+    get_session_or_404(db, session_id)
     rows = db.execute(
         "SELECT u.id, u.username, u.is_admin, COUNT(r.id) as vote_count "
-        "FROM users u LEFT JOIN ratings r ON r.user_id=u.id "
+        "FROM users u JOIN ratings r ON r.user_id=u.id AND r.session_id=? "
         "WHERE u.is_system=0 "
-        "GROUP BY u.id ORDER BY vote_count DESC, u.username"
+        "GROUP BY u.id ORDER BY vote_count DESC, u.username",
+        (session_id,)
     ).fetchall()
     db.close()
     return [dict(r) for r in rows]
 
 
-@app.get("/api/user-stats/{uid}")
-def user_stats(uid: int, user=Depends(current_user)):
+@app.get("/api/sessions/{session_id}/user-stats/{uid}")
+def user_stats(session_id: int, uid: int, user=Depends(current_user)):
     db = get_db()
-    tiers = get_tiers(db)
+    session = get_session_or_404(db, session_id)
+    tiers = get_tiers_for_session(session)
     tier_map = {t["id"]: t for t in tiers}
     tier_order = [t["id"] for t in tiers]
     n = len(tiers)
@@ -1652,26 +2286,29 @@ def user_stats(uid: int, user=Depends(current_user)):
         raise HTTPException(404, "User not found")
 
     tier_counts = {}
-    for row in db.execute("SELECT tier_id, COUNT(*) as cnt FROM ratings WHERE user_id=? GROUP BY tier_id", (uid,)).fetchall():
+    for row in db.execute(
+        "SELECT tier_id, COUNT(*) as cnt FROM ratings WHERE session_id=? AND user_id=? GROUP BY tier_id",
+        (session_id, uid)
+    ).fetchall():
         tier_counts[row["tier_id"]] = row["cnt"]
     total_votes = sum(tier_counts.values())
 
-    user_ratings = db.execute("SELECT photo_id, tier_id FROM ratings WHERE user_id=?", (uid,)).fetchall()
+    user_ratings = db.execute(
+        "SELECT photo_id, tier_id FROM ratings WHERE session_id=? AND user_id=?", (session_id, uid)
+    ).fetchall()
     agree_score = 0.0
     total_compared = 0
     for ur in user_ratings:
         pid = ur["photo_id"]
         others = db.execute(
-            "SELECT tier_id, COUNT(*) as cnt FROM ratings WHERE photo_id=? AND user_id!=?",
-            (pid, uid)
+            "SELECT tier_id, COUNT(*) as cnt FROM ratings WHERE session_id=? AND photo_id=? AND user_id!=?",
+            (session_id, pid, uid)
         ).fetchall()
         if not others:
             continue
         total_other = sum(o["cnt"] for o in others)
-        if total_other == 0:   # <-- добавить эту проверку
+        if total_other == 0:
             continue
-        same = next((o["cnt"] for o in others if o["tier_id"] == ur["tier_id"]), 0)
-        agree_score += same / total_other
         # Сколько из других проголосовало так же как этот пользователь
         same = next((o["cnt"] for o in others if o["tier_id"] == ur["tier_id"]), 0)
         agree_score += same / total_other
@@ -1683,8 +2320,8 @@ def user_stats(uid: int, user=Depends(current_user)):
     top_tier_ids = tier_order[:top_n]
     ph = ",".join("?" * len(top_tier_ids))
     top_photos = [r["photo_id"] for r in db.execute(
-        f"SELECT photo_id FROM ratings WHERE user_id=? AND tier_id IN ({ph})",
-        [uid] + top_tier_ids
+        f"SELECT photo_id FROM ratings WHERE session_id=? AND user_id=? AND tier_id IN ({ph})",
+        [session_id, uid] + top_tier_ids
     ).fetchall()]
 
     fav_tags = []
@@ -1713,10 +2350,11 @@ def user_stats(uid: int, user=Depends(current_user)):
     }
 
 
-@app.get("/api/compare/{uid1}/{uid2}")
-def compare_users(uid1: int, uid2: int, user=Depends(current_user)):
+@app.get("/api/sessions/{session_id}/compare/{uid1}/{uid2}")
+def compare_users(session_id: int, uid1: int, uid2: int, user=Depends(current_user)):
     db = get_db()
-    tiers = get_tiers(db)
+    session = get_session_or_404(db, session_id)
+    tiers = get_tiers_for_session(session)
     tier_order = [t["id"] for t in tiers]
     tier_map = {t["id"]: t for t in tiers}
     n = len(tiers)
@@ -1729,9 +2367,11 @@ def compare_users(uid1: int, uid2: int, user=Depends(current_user)):
         raise HTTPException(404, "User not found")
 
     r1 = {r["photo_id"]: r["tier_id"] for r in
-          db.execute("SELECT photo_id, tier_id FROM ratings WHERE user_id=?", (uid1,)).fetchall()}
+          db.execute("SELECT photo_id, tier_id FROM ratings WHERE session_id=? AND user_id=?",
+                     (session_id, uid1)).fetchall()}
     r2 = {r["photo_id"]: r["tier_id"] for r in
-          db.execute("SELECT photo_id, tier_id FROM ratings WHERE user_id=?", (uid2,)).fetchall()}
+          db.execute("SELECT photo_id, tier_id FROM ratings WHERE session_id=? AND user_id=?",
+                     (session_id, uid2)).fetchall()}
 
     common = set(r1.keys()) & set(r2.keys())
     exact_match = 0

@@ -46,16 +46,90 @@
     </div>
   </div>
 
+  <!-- SESSIONS LIST -->
+  <div id="screen-sessions" class="screen">
+    <header class="topbar">
+      <div class="logo-sm">PHOTO<span>RANK</span></div>
+      <nav class="topbar-nav">
+        <span id="sessions-nav-username"></span>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
+        <button class="nav-btn" onclick="showGallery()" title="Галерея">🖼️</button>
+        <button class="nav-btn" onclick="showPhotoManager()" title="Управление фото">📁</button>
+        <button class="nav-btn" onclick="logout()" title="Выйти">⏻</button>
+      </nav>
+    </header>
+    <main class="sessions-main">
+      <div class="sessions-header">
+        <h1>Сессии оценивания</h1>
+        <button class="btn-primary" onclick="openCreateSessionForm()">+ Новая сессия</button>
+      </div>
+
+      <div class="sessions-join-row">
+        <input type="text" id="join-code-input" placeholder="Код сессии..." class="yadisk-input" style="max-width:240px">
+        <button class="btn-secondary" onclick="joinByCode()">Войти по коду</button>
+      </div>
+
+      <div id="sessions-list" class="sessions-list"></div>
+    </main>
+  </div>
+
+  <!-- CREATE SESSION -->
+  <div id="screen-create-session" class="screen">
+    <header class="topbar">
+      <div class="logo-sm">PHOTO<span>RANK</span></div>
+      <nav class="topbar-nav">
+        <button class="nav-btn" onclick="showSessionsList()">← Назад</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
+      </nav>
+    </header>
+    <main class="admin-main">
+      <h1>Новая сессия</h1>
+      <div class="admin-cards">
+        <div class="admin-card">
+          <h2>Название</h2>
+          <input type="text" id="new-session-title" class="yadisk-input" placeholder="Например: Оценка артов за июнь" style="width:100%">
+        </div>
+
+        <div class="admin-card">
+          <h2>Какие фото включить</h2>
+          <p class="hint">Выберите альбом — «Все фото» либо один из тегов. Самые популярные теги показаны первыми.</p>
+          <label class="radio-row" style="margin-bottom:10px">
+            <input type="checkbox" id="include-suggestions-check" onchange="loadTagOptionsForSessionCreate()">
+            Показывать теги, которые только предложены AI (не подтверждены)
+          </label>
+          <input type="text" id="tag-card-search" class="yadisk-input" placeholder="Поиск альбома..."
+                 style="width:100%; margin-bottom:8px" oninput="onTagCardSearchInput(this.value)">
+          <div id="tag-card-grid" class="tag-card-grid"></div>
+          <label class="radio-row" style="margin-top:12px">
+            <input type="checkbox" id="shuffle-check" checked> Перемешать порядок фото
+          </label>
+        </div>
+
+        <div class="admin-card">
+          <h2>🏷️ Тиры (оценки)</h2>
+          <p class="hint">Настройте свои тиры для этой сессии. Порядок сверху вниз — от лучшего к худшему.</p>
+          <div id="new-session-tier-editor"></div>
+          <div class="tier-editor-actions">
+            <button class="btn-secondary" onclick="addNewSessionTier()">+ Добавить тир</button>
+          </div>
+        </div>
+
+        <button class="btn-primary" onclick="submitCreateSession()" style="align-self:flex-start">Создать сессию</button>
+      </div>
+    </main>
+  </div>
+
   <!-- VOTE -->
   <div id="screen-vote" class="screen">
     <header class="topbar">
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
-        <span id="nav-username"></span>
+        <span id="nav-session-title"></span>
         <button class="nav-btn theme-toggle-icon-target" id="theme-toggle-btn" onclick="toggleTheme()" title="Тема">🌙</button>
         <button class="nav-btn" onclick="showTierlist()" title="Тир-лист">🏆</button>
         <button class="nav-btn" onclick="showStats()" title="Статистика">📊</button>
-        <button class="nav-btn" id="btn-admin-panel" onclick="showAdmin()" title="Админ" style="display:none">⚙️</button>
+        <button class="nav-btn" id="btn-session-admin" onclick="showSessionAdmin()" title="Настройки сессии" style="display:none">⚙️</button>
+        <button class="nav-btn" onclick="showSessionsList()" title="К списку сессий">☰</button>
         <button class="nav-btn" onclick="logout()" title="Выйти">⏻</button>
       </nav>
     </header>
@@ -63,7 +137,7 @@
       <div id="no-photo" class="empty-state" style="display:none">
         <div style="font-size:3rem">🖼️</div>
         <p>Фото ещё не выбрано.</p>
-        <p class="sub">Администратор запустит голосование.</p>
+        <p class="sub">Создатель сессии запустит голосование.</p>
       </div>
       <div id="vote-content">
         <div class="photo-frame" id="photo-frame">
@@ -105,7 +179,7 @@
             </div>
           </div>
           <div id="admin-controls" class="admin-bar" style="display:none">
-            <div class="admin-bar-title">⚙️ Управление</div>
+            <div class="admin-bar-title">⚙️ Управление сессией</div>
             <div class="admin-bar-btns">
               <button class="admin-btn" onclick="prevPhoto()" title="← или стрелка влево">← Назад</button>
               <button class="admin-btn accent" onclick="nextPhoto()" title="→ или стрелка вправо">Вперёд →</button>
@@ -126,6 +200,7 @@
     <header class="topbar">
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
+        <span id="tierlist-nav-session-title"></span>
         <button class="nav-btn" onclick="showVote()">← Назад</button>
         <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
         <button class="nav-btn" onclick="logout()">⏻</button>
@@ -134,27 +209,12 @@
     <main class="tierlist-main">
       <div class="tierlist-header">
         <div>
-          <h1 class="tierlist-title">Тир-лист <span>результатов</span></h1>
-          <p class="tierlist-sub">По средней оценке всех пользователей</p>
+          <h1 class="tierlist-title">Тир-лист <span>сессии</span></h1>
+          <p class="tierlist-sub" id="tierlist-session-sub">По средней оценке участников</p>
         </div>
         <div class="export-btns">
           <button class="btn-secondary" onclick="exportPNG()">🖼️ Сохранить PNG</button>
           <button class="btn-secondary" onclick="exportCSV()">📄 Экспорт CSV</button>
-        </div>
-      </div>
-
-      <!-- TAG FILTER PANEL -->
-      <div class="tl-filter-panel">
-        <div class="tl-filter-header">
-          <span class="tl-filter-title">🏷️ Фильтр по тегам</span>
-          <span class="tl-filter-hint" id="tl-filter-hint">Выберите теги для фильтра</span>
-          <button class="tl-filter-clear" id="tl-filter-clear" onclick="clearTagFilter()" style="display:none">✕ Сбросить</button>
-        </div>
-        <div class="tl-filter-search-wrap">
-          <input class="tl-filter-search" id="tl-filter-search" placeholder="Поиск тега..." oninput="filterTagSearch(this.value)" autocomplete="off">
-        </div>
-        <div class="tl-tag-list" id="tl-tag-list">
-          <span class="tl-tags-loading">Загрузка тегов...</span>
         </div>
       </div>
 
@@ -171,6 +231,7 @@
     <header class="topbar">
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
+        <span id="stats-nav-session-title"></span>
         <button class="nav-btn" onclick="showVote()">← Назад</button>
         <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
         <button class="nav-btn" onclick="logout()">⏻</button>
@@ -197,8 +258,8 @@
     </main>
   </div>
 
-  <!-- ADMIN -->
-  <div id="screen-admin" class="screen">
+  <!-- SESSION ADMIN (тиры конкретной сессии — видно только владельцу) -->
+  <div id="screen-session-admin" class="screen">
     <header class="topbar">
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
@@ -207,7 +268,118 @@
       </nav>
     </header>
     <main class="admin-main">
-      <h1>Панель администратора</h1>
+      <h1>Настройки сессии</h1>
+      <div class="admin-cards">
+        <div class="admin-card">
+          <h2>🏷️ Тиры (оценки)</h2>
+          <p class="hint">Добавляйте, удаляйте и переименовывайте тиры этой сессии. Порядок сверху вниз — от лучшего к худшему. Изменение тиров не пересчитывает уже поставленные оценки.</p>
+          <div id="session-tier-editor"></div>
+          <div class="tier-editor-actions">
+            <button class="btn-secondary" onclick="addSessionTier()">+ Добавить тир</button>
+            <button class="btn-primary" onclick="saveSessionTierLabels()">Сохранить</button>
+          </div>
+        </div>
+
+        <div class="admin-card danger-card">
+          <h2>🔚 Завершить сессию</h2>
+          <p class="hint">Сессия исчезнет из общего списка активных. Голоса и тир-лист сохранятся, но новые подключения будут невозможны.</p>
+          <button class="btn-danger" onclick="endCurrentSession()">Завершить сессию</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- GALLERY (просмотр всех фото вне сессий, без оценок/тегов) -->
+  <div id="screen-gallery" class="screen">
+    <header class="topbar">
+      <div class="logo-sm">PHOTO<span>RANK</span></div>
+      <nav class="topbar-nav">
+        <span id="gallery-nav-username"></span>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
+        <button class="nav-btn" onclick="showPublishedTierlist()" title="Официальный тир-лист">🏆</button>
+        <button class="nav-btn" onclick="showSessionsList()" title="Сессии оценивания">🎬</button>
+        <button class="nav-btn" onclick="showPhotoManager()" title="Управление фото">📁</button>
+        <button class="nav-btn" id="btn-publish-tierlist" onclick="openPublishTierlistModal()" title="Опубликовать тир-лист сессии" style="display:none">📌</button>
+        <button class="nav-btn" onclick="logout()" title="Выйти">⏻</button>
+      </nav>
+    </header>
+    <main class="tierlist-main">
+      <div class="tierlist-header">
+        <div>
+          <h1 class="tierlist-title">Галерея</h1>
+          <p class="tierlist-sub">Все фото на сайте — для просмотра, без оценок и тегов</p>
+        </div>
+      </div>
+
+      <div class="tl-filter-panel">
+        <div class="tl-filter-header">
+          <span class="tl-filter-title">🏷️ Фильтр по тегу</span>
+          <span class="tl-filter-hint" id="gallery-filter-hint">Выберите тег</span>
+          <button class="tl-filter-clear" id="gallery-filter-clear" onclick="clearGalleryTagFilter()" style="display:none">✕ Сбросить</button>
+        </div>
+        <div class="tl-filter-search-wrap">
+          <input class="tl-filter-search" id="gallery-tag-search" placeholder="Поиск тега..." oninput="renderGalleryTagPanel(this.value)" autocomplete="off">
+        </div>
+        <label class="radio-row" style="margin-bottom:10px">
+          <input type="checkbox" id="gallery-show-ai-check" onchange="loadGalleryTags()">
+          Показывать теги, предложенные AI (не подтверждены)
+        </label>
+        <div class="tl-tag-list" id="gallery-tag-list">
+          <span class="tl-tags-loading">Загрузка тегов...</span>
+        </div>
+      </div>
+
+      <div id="gallery-grid" class="gallery-grid"></div>
+      <div id="gallery-empty" class="empty-state" style="display:none">
+        <div style="font-size:3rem">🖼️</div><p>Фото не найдены.</p>
+      </div>
+    </main>
+  </div>
+
+  <!-- PUBLISHED TIERLIST (отдельная вкладка — официальный тир-лист, опубликованный админом) -->
+  <div id="screen-published-tierlist" class="screen">
+    <header class="topbar">
+      <div class="logo-sm">PHOTO<span>RANK</span></div>
+      <nav class="topbar-nav">
+        <button class="nav-btn" onclick="showGallery()" title="К галерее">← Назад</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
+        <button class="nav-btn" id="btn-publish-tierlist-2" onclick="openPublishTierlistModal()" title="Опубликовать тир-лист сессии" style="display:none">📌</button>
+      </nav>
+    </header>
+    <main class="tierlist-main">
+      <div class="tierlist-header">
+        <div>
+          <h1 class="tierlist-title">Официальный <span>тир-лист</span></h1>
+          <p class="tierlist-sub">Снимок тир-листа, опубликованный администратором</p>
+        </div>
+      </div>
+      <div id="published-tierlist-content"></div>
+    </main>
+  </div>
+
+  <!-- PUBLISH TIERLIST MODAL -->
+  <div id="publish-tierlist-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this) this.style.display='none'">
+    <div class="modal-box" style="max-width:560px">
+      <button class="modal-close" onclick="document.getElementById('publish-tierlist-modal').style.display='none'">✕</button>
+      <div class="modal-info" style="width:100%">
+        <div class="modal-section-title" style="font-size:1.05rem;margin-bottom:12px">Опубликовать тир-лист на главную</div>
+        <p class="hint" style="margin-bottom:12px">Выберите сессию — её тир-лист будет показан на главной странице как снимок на текущий момент. Снимок не обновляется автоматически.</p>
+        <div id="publishable-sessions-list" class="sessions-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHOTO MANAGER (глобальное, не зависит от сессии) -->
+  <div id="screen-photo-manager" class="screen">
+    <header class="topbar">
+      <div class="logo-sm">PHOTO<span>RANK</span></div>
+      <nav class="topbar-nav">
+        <button class="nav-btn" onclick="showGallery()">← Назад</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
+      </nav>
+    </header>
+    <main class="admin-main">
+      <h1>Управление фото</h1>
       <div class="admin-cards">
 
         <div class="admin-card" id="wd14-status-card">
@@ -216,19 +388,9 @@
           <div id="wd14-status-content">Проверка статуса…</div>
         </div>
 
-        <div class="admin-card">
-          <h2>🏷️ Настройка тиров</h2>
-          <p class="hint">Добавляйте, удаляйте и переименовывайте тиры. Порядок сверху вниз — от лучшего к худшему.</p>
-          <div id="tier-editor"></div>
-          <div class="tier-editor-actions">
-            <button class="btn-secondary" onclick="addTier()">+ Добавить тир</button>
-            <button class="btn-primary" onclick="saveTierLabels()">Сохранить</button>
-          </div>
-        </div>
-
-        <div class="admin-card danger-card">
+        <div class="admin-card danger-card" id="reset-db-card" style="display:none">
           <h2>🗑️ Сброс базы данных</h2>
-          <p class="hint">Удалит всех пользователей (кроме администраторов), все фотографии и оценки. Действие необратимо.</p>
+          <p class="hint">Удалит всех пользователей (кроме администраторов), все фотографии, оценки и ВСЕ сессии. Действие необратимо. Доступно только администраторам сайта.</p>
           <button class="btn-danger" onclick="resetDB()">Полностью очистить БД</button>
         </div>
 

@@ -1,6 +1,8 @@
 const API = '';
 let token = localStorage.getItem('token') || null;
 let me = null;
+let currentSessionId = null;     // id сессии, в которой сейчас находится пользователь (голосование/тир-лист/настройки)
+let currentSessionInfo = null;   // последний полученный /api/sessions/{id} — для is_owner, title и т.п.
 let currentPhotoId = null;
 let selectedTierId = null;
 let tiers = [];
@@ -94,8 +96,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (token) {
     try {
       me = await req('GET', '/api/me');
-      tiers = await req('GET', '/api/tiers');
-      showVote();
+      afterAuthSuccess();
     } catch { token = null; localStorage.removeItem('token'); showScreen('auth'); }
   } else { showScreen('auth'); }
 });
@@ -105,21 +106,70 @@ function showScreen(name) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById('screen-' + name)?.classList.add('active');
 }
-function showVote() {
-  showScreen('vote');
-  document.getElementById('nav-username').textContent = me?.username || '';
-  document.getElementById('btn-admin-panel').style.display = me?.is_admin ? '' : 'none';
-  document.getElementById('admin-controls').style.display = me?.is_admin ? '' : 'none';
-  loadCurrentPhoto(); startPolling();
-  if (me?.is_admin) loadAutoAdvanceState();
+
+function showSessionsList() {
+  clearPolling();
+  currentSessionId = null;
+  showScreen('sessions');
+  document.getElementById('sessions-nav-username').textContent = me?.username || '';
+  loadSessionsList();
+  try { history.replaceState(null, '', location.pathname); } catch {}
 }
-function showAdmin() { clearPolling(); showScreen('admin'); loadPhotos(); loadAdminStats(); renderTierEditor(); loadWatchStatus(); loadGdriveWatchStatus(); loadWd14Status(); checkDuplicatePhotos(); }
+
+async function showVote(sessionId) {
+  if (sessionId) currentSessionId = sessionId;
+  if (!currentSessionId) { showSessionsList(); return; }
+  showScreen('vote');
+  try {
+    currentSessionInfo = await req('GET', `/api/sessions/${currentSessionId}`);
+    document.getElementById('nav-session-title').textContent = currentSessionInfo.title || '';
+    document.getElementById('btn-session-admin').style.display = currentSessionInfo.is_owner ? '' : 'none';
+    document.getElementById('admin-controls').style.display = currentSessionInfo.is_owner ? '' : 'none';
+    try { history.replaceState(null, '', '#' + currentSessionInfo.code); } catch {}
+  } catch (e) {
+    toast(e.message || 'Сессия недоступна', 'err');
+    showSessionsList();
+    return;
+  }
+  loadCurrentPhoto(); startPolling();
+  connectWS();
+  if (currentSessionInfo.is_owner) loadAutoAdvanceState();
+}
+
+function showSessionAdmin() {
+  if (!currentSessionId) return;
+  clearPolling();
+  showScreen('session-admin');
+  renderSessionTierEditor();
+}
+
+function showPhotoManager() {
+  clearPolling();
+  showScreen('photo-manager');
+  document.getElementById('reset-db-card').style.display = me?.is_admin ? '' : 'none';
+  loadPhotos(); loadAdminStats(); loadWatchStatus(); loadGdriveWatchStatus(); loadWd14Status(); checkDuplicatePhotos();
+}
 
 // ── AUTH ─────────────────────────────────────────────────────────────────────
 function switchTab(tab) {
   document.querySelectorAll('.tab-btn').forEach((b,i) => b.classList.toggle('active',(i===0)===(tab==='login')));
   document.getElementById('form-login').classList.toggle('hidden', tab!=='login');
   document.getElementById('form-register').classList.toggle('hidden', tab!=='register');
+}
+async function afterAuthSuccess() {
+  // После входа: если в ссылке есть код сессии (#abc123) — сразу заходим в неё,
+  // иначе показываем галерею — она теперь стартовый экран сайта.
+  const codeFromHash = location.hash?.replace('#', '').trim();
+  if (codeFromHash) {
+    try {
+      const r = await req('GET', `/api/sessions/by-code/${encodeURIComponent(codeFromHash)}`);
+      showVote(r.session_id);
+      return;
+    } catch (e) {
+      toast('Сессия по ссылке не найдена', 'err');
+    }
+  }
+  showGallery();
 }
 async function doLogin(e) {
   e.preventDefault();
@@ -129,8 +179,7 @@ async function doLogin(e) {
       password: document.getElementById('login-password').value });
     token = d.token; localStorage.setItem('token', token);
     me = {username: d.username, is_admin: d.is_admin};
-    tiers = await req('GET', '/api/tiers');
-    showVote();
+    afterAuthSuccess();
   } catch(e) { document.getElementById('login-error').textContent = e.message; }
 }
 async function doRegister(e) {
@@ -141,18 +190,216 @@ async function doRegister(e) {
       password: document.getElementById('reg-password').value });
     token = d.token; localStorage.setItem('token', token);
     me = {username: d.username, is_admin: d.is_admin};
-    tiers = await req('GET', '/api/tiers');
-    showVote();
+    afterAuthSuccess();
   } catch(e) { document.getElementById('reg-error').textContent = e.message; }
 }
 function logout() {
-  clearPolling(); token = null; me = null; localStorage.removeItem('token'); showScreen('auth');
+  clearPolling(); token = null; me = null; currentSessionId = null;
+  localStorage.removeItem('token'); showScreen('auth');
+}
+
+// ── SESSIONS LIST & CREATE ───────────────────────────────────────────────────
+async function loadSessionsList() {
+  const el = document.getElementById('sessions-list');
+  el.innerHTML = '<div class="sessions-empty">Загрузка...</div>';
+  try {
+    const list = await req('GET', '/api/sessions');
+    if (!list.length) {
+      el.innerHTML = '<div class="sessions-empty">Активных сессий пока нет — создайте первую.</div>';
+      return;
+    }
+    el.innerHTML = list.map(s => `
+      <div class="session-card" onclick="showVote(${s.id})">
+        <div class="session-card-main">
+          <div class="session-card-title">${escapeHtml(s.title)}</div>
+          <div class="session-card-meta">от ${escapeHtml(s.creator_username)} · ${s.photo_count} фото · ${s.participant_count} участников</div>
+        </div>
+        <span class="session-card-badge ${s.voting_open ? 'open' : 'closed'}">${s.voting_open ? 'идёт' : 'закрыта'}</span>
+      </div>`).join('');
+  } catch (e) {
+    el.innerHTML = `<div class="sessions-empty">Ошибка загрузки: ${e.message}</div>`;
+  }
+}
+
+async function joinByCode() {
+  const code = document.getElementById('join-code-input').value.trim();
+  if (!code) { toast('Введите код сессии', 'err'); return; }
+  try {
+    const r = await req('GET', `/api/sessions/by-code/${encodeURIComponent(code)}`);
+    showVote(r.session_id);
+  } catch (e) { toast(e.message || 'Сессия не найдена', 'err'); }
+}
+
+let newSessionTiers = [];
+
+function openCreateSessionForm() {
+  newSessionTiers = JSON.parse(JSON.stringify(DEFAULT_TIERS_TEMPLATE));
+  document.getElementById('new-session-title').value = '';
+  document.getElementById('shuffle-check').checked = true;
+  document.getElementById('tag-card-search').value = '';
+  document.getElementById('include-suggestions-check').checked = false;
+  renderNewSessionTierEditor();
+  loadTagOptionsForSessionCreate();
+  showScreen('create-session');
+}
+
+let allTagsForSessionCreate = [];      // топ-10 тегов от /api/tierlist/tags (с превью, is_favorite, has_confirmed)
+let allPhotosPreview = null;           // {filename} — случайное превью для плитки "Все фото"
+let selectedAlbumId = 'all';           // 'all' | tagId — что выбрано в сетке альбомов сейчас
+
+async function loadTagOptionsForSessionCreate() {
+  const grid = document.getElementById('tag-card-grid');
+  grid.innerHTML = '<div class="tag-card-empty">Загрузка альбомов...</div>';
+  selectedAlbumId = 'all';
+  document.getElementById('tag-card-search').value = '';
+  try {
+    const [tagsList, allPreview] = await Promise.all([
+      req('GET', `/api/tierlist/tags?include_suggestions=${includeSuggestionsFlag()}`),
+      allPhotosPreview ? Promise.resolve(allPhotosPreview) : req('GET', '/api/photos/random-preview')
+    ]);
+    allTagsForSessionCreate = tagsList;
+    allPhotosPreview = allPreview;
+    renderTagCardGrid('');
+  } catch {
+    grid.innerHTML = '<div class="tag-card-empty">Ошибка загрузки альбомов</div>';
+  }
+}
+
+function includeSuggestionsFlag() {
+  return document.getElementById('include-suggestions-check').checked;
+}
+
+let tagCardSearchDebounce = null;
+
+function onTagCardSearchInput(value) {
+  // Без запроса — мгновенно показываем кэш (топ-10, уже на руках).
+  // С запросом — идём на backend искать по ВСЕМ тегам сайта (не только
+  // витрине из топ-10), с небольшой задержкой, чтобы не слать запрос на
+  // каждое нажатие клавиши.
+  clearTimeout(tagCardSearchDebounce);
+  const q = (value || '').trim();
+  if (!q) { renderTagCardGrid(''); return; }
+  tagCardSearchDebounce = setTimeout(() => searchTagCardsRemote(q), 250);
+}
+
+async function searchTagCardsRemote(q) {
+  const grid = document.getElementById('tag-card-grid');
+  try {
+    const results = await req('GET',
+      `/api/tierlist/tags?include_suggestions=${includeSuggestionsFlag()}&q=${encodeURIComponent(q)}`);
+    renderTagCardGrid(q, results);
+  } catch {
+    grid.innerHTML = '<div class="tag-card-empty">Ошибка поиска</div>';
+  }
+}
+
+function renderTagCardGrid(query, searchResults) {
+  const grid = document.getElementById('tag-card-grid');
+  const q = (query || '').trim().toLowerCase();
+
+  // Плитка "Все фото" — всегда первая, видна и при поиске (если запрос не задан
+  // или совпадает с её названием), как обычный альбом в галерее.
+  const allCardMatches = !q || 'все фото'.includes(q);
+
+  let tagCards;
+  if (!q) {
+    // без поиска — витрина топ-10, уже на руках, без лимита (backend уже
+    // прислал ровно столько, сколько нужно показать); урезаем до 9, чтобы
+    // вместе с плиткой "Все фото" было ровно 10.
+    tagCards = allTagsForSessionCreate.slice(0, 9);
+  } else {
+    // с поиском — список уже пришёл с backend по полному набору тегов сайта,
+    // никакого дополнительного урезания не делаем.
+    tagCards = searchResults || [];
+  }
+
+  if (!allCardMatches && !tagCards.length) {
+    grid.innerHTML = '<div class="tag-card-empty">Ничего не найдено</div>';
+    return;
+  }
+
+  let html = '';
+  if (allCardMatches) {
+    html += `
+      <div class="tag-card ${selectedAlbumId === 'all' ? 'selected' : ''}" data-album-id="all" onclick="selectAlbumCard('all')" title="Все фото">
+        ${allPhotosPreview?.filename
+          ? `<img src="/photos/${allPhotosPreview.filename}" alt="" loading="lazy">`
+          : `<div class="tag-card-noimg">🖼️</div>`}
+        <div class="tag-card-overlay">Все фото</div>
+      </div>`;
+  }
+  html += tagCards.map(t => `
+    <div class="tag-card ${t.id === selectedAlbumId ? 'selected' : ''}" data-album-id="${t.id}" onclick="selectAlbumCard(${t.id})" title="${escapeHtml(t.name)}">
+      ${t.preview_filename
+        ? `<img src="/photos/${t.preview_filename}" alt="" loading="lazy">`
+        : `<div class="tag-card-noimg">🏷️</div>`}
+      ${t.is_favorite ? '<span class="tag-card-fav-badge" title="Один из ваших любимых тегов">⭐</span>' : ''}
+      ${!t.has_confirmed ? '<span class="tag-card-ai-badge">только AI</span>' : ''}
+      <div class="tag-card-overlay">${escapeHtml(t.name)} <span class="tag-card-count">${t.photo_count}</span></div>
+    </div>
+  `).join('');
+
+  grid.innerHTML = html;
+}
+
+function selectAlbumCard(albumId) {
+  selectedAlbumId = albumId;
+  document.querySelectorAll('.tag-card').forEach(el => {
+    el.classList.toggle('selected', String(el.dataset.albumId) === String(albumId));
+  });
+}
+
+async function submitCreateSession() {
+  const title = document.getElementById('new-session-title').value.trim();
+  const isAllPhotos = selectedAlbumId === 'all';
+  const includeSuggestions = document.getElementById('include-suggestions-check').checked;
+  const shuffle = document.getElementById('shuffle-check').checked;
+
+  if (newSessionTiers.length < 2) { toast('Нужно минимум 2 тира', 'err'); return; }
+  if (!isAllPhotos && !selectedAlbumId) { toast('Выберите альбом', 'err'); return; }
+
+  try {
+    const body = {
+      title, tiers: newSessionTiers,
+      photo_filter: isAllPhotos ? 'all' : 'tag',
+      tag_id: isAllPhotos ? null : selectedAlbumId,
+      include_suggestions: includeSuggestions, shuffle
+    };
+    const resp = await fetch(API + '/api/sessions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token},
+      body: JSON.stringify(body)
+    });
+    const json = await resp.json();
+    if (!resp.ok) throw new Error(json.detail || 'Ошибка создания сессии');
+    toast(`Сессия создана: ${json.photo_count} фото`, 'ok');
+    showVote(json.id);
+  } catch (e) {
+    toast(e.message || 'Ошибка', 'err');
+  }
+}
+
+async function endCurrentSession() {
+  if (!currentSessionId) return;
+  if (!confirm('Завершить сессию? Она исчезнет из списка активных, но данные сохранятся.')) return;
+  try {
+    await req('POST', `/api/sessions/${currentSessionId}/end`);
+    toast('Сессия завершена', 'ok');
+    showSessionsList();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s ?? '';
+  return d.innerHTML;
 }
 
 // ── VOTING ────────────────────────────────────────────────────────────────────
 async function loadCurrentPhoto() {
+  if (!currentSessionId) return;
   try {
-    const data = await req('GET', '/api/current-photo');
+    const data = await req('GET', `/api/sessions/${currentSessionId}/current-photo`);
     if (data.tiers?.length) tiers = data.tiers;
     renderCurrentPhoto(data);
     loadTags();
@@ -213,7 +460,7 @@ function renderCurrentPhoto(data) {
     document.getElementById('btn-vote').disabled = true;
     document.getElementById('btn-vote').textContent = 'Выберите оценку';
   }
-  if (me?.is_admin)
+  if (currentSessionInfo?.is_owner)
     document.getElementById('admin-stats').textContent = `Голосов: ${voteCount}`;
 }
 
@@ -259,9 +506,9 @@ function selectTier(id, evt) {
 }
 
 async function submitVote() {
-  if (!selectedTierId || !currentPhotoId) return;
+  if (!selectedTierId || !currentPhotoId || !currentSessionId) return;
   try {
-    await formReq('/api/rate', {photo_id: currentPhotoId, tier_id: selectedTierId});
+    await formReq(`/api/sessions/${currentSessionId}/rate`, {photo_id: currentPhotoId, tier_id: selectedTierId});
     toast('Оценка сохранена!', 'ok'); loadCurrentPhoto();
   } catch(e) { toast(e.message || 'Ошибка', 'err'); }
 }
@@ -280,11 +527,11 @@ function clearPolling() {
 }
 
 function connectWS() {
-  if (!token) return;
+  if (!token || !currentSessionId) return;
   if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}&session_id=${currentSessionId}`);
 
   ws.onopen = () => {
     console.log('WS connected');
@@ -299,7 +546,7 @@ function connectWS() {
         loadCurrentPhoto();
       }
       if (msg.type === 'vote_update' || msg.type === 'photo_change') {
-        if (me?.is_admin) loadOnlineUsers();
+        if (currentSessionInfo?.is_owner) loadOnlineUsers();
       }
       if (msg.type === 'auto_advance_changed') {
         autoAdvanceEnabled = msg.enabled;
@@ -310,7 +557,7 @@ function connectWS() {
       if (msg.type === 'all_done') {
         selectedTierId = null;
         loadCurrentPhoto();
-        if (me?.is_admin) toast('Все фото просмотрены!', 'ok');
+        if (currentSessionInfo?.is_owner) toast('Все фото просмотрены!', 'ok');
       }
     } catch {}
   };
@@ -323,27 +570,31 @@ function connectWS() {
   ws.onerror = () => { ws.close(); };
 }
 
-// ── ADMIN NAV ─────────────────────────────────────────────────────────────────
+// ── SESSION ADMIN NAV (управление текущей сессией — доступно только владельцу) ──
 async function nextPhoto() {
+  if (!currentSessionId) return;
   try {
-    const d = await req('POST', '/api/admin/next-photo');
+    const d = await req('POST', `/api/sessions/${currentSessionId}/next-photo`);
     if (d.done) toast('Все фотографии просмотрены!', 'ok');
     else { selectedTierId = null; pendingNavDirection = 'next'; loadCurrentPhoto(); }
   } catch(e) { toast(e.message,'err'); }
 }
 async function prevPhoto() {
-  try { await req('POST', '/api/admin/prev-photo'); selectedTierId=null; pendingNavDirection = 'prev'; loadCurrentPhoto(); }
+  if (!currentSessionId) return;
+  try { await req('POST', `/api/sessions/${currentSessionId}/prev-photo`); selectedTierId=null; pendingNavDirection = 'prev'; loadCurrentPhoto(); }
   catch(e) { toast(e.message||'Уже первая','err'); }
 }
 async function closeVoting() {
-  try { await req('POST','/api/admin/close-voting'); toast('Закрыто','ok'); loadCurrentPhoto(); }
+  if (!currentSessionId) return;
+  try { await req('POST', `/api/sessions/${currentSessionId}/close-voting`); toast('Закрыто','ok'); loadCurrentPhoto(); }
   catch(e) { toast(e.message,'err'); }
 }
 
 async function shufflePhotos() {
+  if (!currentSessionId) return;
   if (!confirm('Перемешать все фотографии в случайном порядке и начать с первой?')) return;
   try {
-    const d = await req('POST', '/api/admin/shuffle');
+    const d = await req('POST', `/api/sessions/${currentSessionId}/shuffle`);
     toast(`Перемешано ${d.count} фото 🔀`, 'ok');
     selectedTierId = null;
     loadCurrentPhoto();
@@ -351,9 +602,10 @@ async function shufflePhotos() {
 }
 
 async function toggleAutoAdvance() {
+  if (!currentSessionId) return;
   try {
     const newState = !autoAdvanceEnabled;
-    await formReq('/api/admin/auto-advance', { enabled: newState });
+    await formReq(`/api/sessions/${currentSessionId}/auto-advance`, { enabled: newState });
     autoAdvanceEnabled = newState;
     updateAutoAdvanceBtn();
     toast(newState ? '⚡ Авто-переход включён' : 'Авто-переход выключен', 'ok');
@@ -375,9 +627,9 @@ function updateAutoAdvanceBtn() {
 }
 
 async function loadAutoAdvanceState() {
-  if (!me?.is_admin) return;
+  if (!currentSessionInfo?.is_owner || !currentSessionId) return;
   try {
-    const d = await req('GET', '/api/admin/auto-advance');
+    const d = await req('GET', `/api/sessions/${currentSessionId}/auto-advance`);
     autoAdvanceEnabled = d.enabled;
     updateAutoAdvanceBtn();
     if (d.enabled) loadOnlineUsers();
@@ -385,11 +637,11 @@ async function loadAutoAdvanceState() {
 }
 
 async function loadOnlineUsers() {
-  if (!me?.is_admin) return;
+  if (!currentSessionInfo?.is_owner || !currentSessionId) return;
   const bar = document.getElementById('online-users-bar');
   if (!autoAdvanceEnabled) { bar.style.display = 'none'; return; }
   try {
-    const d = await req('GET', '/api/online-users');
+    const d = await req('GET', `/api/sessions/${currentSessionId}/online-users`);
     if (!d.count) {
       bar.innerHTML = '<span class="online-label">Онлайн: нет участников</span>';
     } else {
@@ -410,9 +662,9 @@ document.addEventListener('keydown', e => {
   if (!document.getElementById('screen-vote')?.classList.contains('active')) return;
 
   if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-    if (me?.is_admin) { e.preventDefault(); nextPhoto(); }
+    if (currentSessionInfo?.is_owner) { e.preventDefault(); nextPhoto(); }
   } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-    if (me?.is_admin) { e.preventDefault(); prevPhoto(); }
+    if (currentSessionInfo?.is_owner) { e.preventDefault(); prevPhoto(); }
   } else if (e.key === ' ' || e.key === 'Enter') {
     // пробел/Enter — подтвердить оценку
     const btn = document.getElementById('btn-vote');
@@ -422,68 +674,91 @@ document.addEventListener('keydown', e => {
 
 // ── TIER EDITOR ───────────────────────────────────────────────────────────────
 const PALETTE = ['#ff6b6b','#ff8c42','#ffd43b','#a9e34b','#4ae8a0','#74c0fc','#a78bfa','#f472b6','#94a3b8','#ffffff'];
+const DEFAULT_TIERS_TEMPLATE = [
+  {id: null, label: 'шедевр', color: '#ff6b6b'},
+  {id: null, label: 'A', color: '#ffa94d'},
+  {id: null, label: 'B', color: '#ffd43b'},
+  {id: null, label: 'C', color: '#74c0fc'},
+];
 
-function renderTierEditor() {
-  const el = document.getElementById('tier-editor');
-  el.innerHTML = tiers.map((t, i) => tierRow(t, i)).join('');
-}
-
-function tierRow(t, i) {
-  return `<div class="tier-edit-row" data-idx="${i}">
-    <div class="tier-color-pick">
-      <div class="tier-color-swatch" style="background:${t.color}" onclick="togglePalette(${i})"></div>
-      <div class="tier-palette" id="palette-${i}" style="display:none">
-        ${PALETTE.map(c => `<div class="pal-dot" style="background:${c}" onclick="pickColor(${i},'${c}')"></div>`).join('')}
-        <input type="color" value="${t.color}" oninput="pickColor(${i},this.value)" title="Свой цвет">
+// Обобщённый редактор тиров: рисует список в любой контейнер по id,
+// храня данные в переданном массиве (мутирует его прямо по ссылке) и
+// вызывая onRemove(idx) при удалении строки (чтобы вызывающий мог сам
+// решить, как перерисовать после удаления — массив тиров у разных
+// экранов разный: newSessionTiers при создании, sessionAdminTiers в
+// настройках существующей сессии).
+function renderTierEditorGeneric(containerId, tiersArray, onLabelChange, onRemove) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = tiersArray.map((t, i) => `
+    <div class="tier-edit-row" data-idx="${i}">
+      <div class="tier-color-pick">
+        <div class="tier-color-swatch" style="background:${t.color}" onclick="toggleGenericPalette('${containerId}',${i})"></div>
+        <div class="tier-palette" id="palette-${containerId}-${i}" style="display:none">
+          ${PALETTE.map(c => `<div class="pal-dot" style="background:${c}" onclick="pickGenericColor('${containerId}',${i},'${c}')"></div>`).join('')}
+          <input type="color" value="${t.color}" oninput="pickGenericColor('${containerId}',${i},this.value)" title="Свой цвет">
+        </div>
       </div>
-    </div>
-    <input class="tier-edit-input" value="${t.label}" maxlength="30"
-      oninput="updateTierLabel(${i},this.value)" placeholder="Название тира">
-    <button class="tier-del-btn" onclick="removeTier(${i})" title="Удалить" ${tiers.length<=2?'disabled':''}>✕</button>
-    <div class="tier-drag-hint">⠿</div>
-  </div>`;
-}
+      <input class="tier-edit-input" value="${t.label}" maxlength="30"
+        oninput="window.__tierEditorState['${containerId}'][${i}].label=this.value"
+        placeholder="Название тира">
+      <button class="tier-del-btn" onclick="removeGenericTier('${containerId}',${i})" title="Удалить" ${tiersArray.length<=2?'disabled':''}>✕</button>
+      <div class="tier-drag-hint">⠿</div>
+    </div>`).join('');
 
-function togglePalette(i) {
-  document.querySelectorAll('.tier-palette').forEach((p,j) => {
+  window.__tierEditorState = window.__tierEditorState || {};
+  window.__tierEditorState[containerId] = tiersArray;
+  window.__tierEditorRenderers = window.__tierEditorRenderers || {};
+  window.__tierEditorRenderers[containerId] = () => renderTierEditorGeneric(containerId, tiersArray, onLabelChange, onRemove);
+}
+function toggleGenericPalette(containerId, i) {
+  document.querySelectorAll(`#${containerId} .tier-palette`).forEach((p, j) => {
     p.style.display = (j===i && p.style.display==='none') ? 'flex' : 'none';
   });
 }
-
-function pickColor(i, color) {
-  tiers[i].color = color;
-  document.querySelectorAll('.tier-palette')[i].style.display = 'none';
-  renderTierEditor();
+function pickGenericColor(containerId, i, color) {
+  window.__tierEditorState[containerId][i].color = color;
+  window.__tierEditorRenderers[containerId]();
+}
+function removeGenericTier(containerId, i) {
+  const arr = window.__tierEditorState[containerId];
+  if (arr.length <= 2) return;
+  arr.splice(i, 1);
+  window.__tierEditorRenderers[containerId]();
 }
 
-function updateTierLabel(i, val) { tiers[i].label = val; }
-
-function removeTier(i) {
-  if (tiers.length <= 2) return;
-  tiers.splice(i, 1);
-  renderTierEditor();
+// ── Тиры в форме СОЗДАНИЯ сессии (массив newSessionTiers) ──────────────────
+function renderNewSessionTierEditor() {
+  renderTierEditorGeneric('new-session-tier-editor', newSessionTiers);
+}
+function addNewSessionTier() {
+  if (newSessionTiers.length >= 10) { toast('Максимум 10 тиров', 'err'); return; }
+  newSessionTiers.push({id: null, label: 'Новый тир', color: PALETTE[newSessionTiers.length % PALETTE.length]});
+  renderNewSessionTierEditor();
 }
 
-function addTier() {
-  if (tiers.length >= 10) { toast('Максимум 10 тиров','err'); return; }
-  tiers.push({id: 'new_'+Date.now(), label: 'Новый тир', color: '#888888', order: tiers.length});
-  renderTierEditor();
-  // scroll to bottom of editor
-  document.getElementById('tier-editor').lastElementChild?.scrollIntoView({behavior:'smooth'});
+// ── Тиры в НАСТРОЙКАХ уже существующей сессии (массив sessionAdminTiers) ───
+let sessionAdminTiers = [];
+function renderSessionTierEditor() {
+  sessionAdminTiers = JSON.parse(JSON.stringify(currentSessionInfo?.tiers || tiers));
+  renderTierEditorGeneric('session-tier-editor', sessionAdminTiers);
 }
-
-async function saveTierLabels() {
-  // read current input values
-  document.querySelectorAll('.tier-edit-row').forEach((row, i) => {
-    const input = row.querySelector('.tier-edit-input');
-    if (input) tiers[i].label = input.value.trim() || tiers[i].label;
-  });
+function addSessionTier() {
+  if (sessionAdminTiers.length >= 10) { toast('Максимум 10 тиров', 'err'); return; }
+  sessionAdminTiers.push({id: null, label: 'Новый тир', color: PALETTE[sessionAdminTiers.length % PALETTE.length]});
+  renderTierEditorGeneric('session-tier-editor', sessionAdminTiers);
+}
+async function saveSessionTierLabels() {
+  if (!currentSessionId) return;
   try {
-    tiers = await req('POST', '/api/admin/tiers', {tiers});
+    const updated = await req('POST', `/api/sessions/${currentSessionId}/tiers`, {tiers: sessionAdminTiers});
+    tiers = updated;
     toast('Тиры сохранены!', 'ok');
-    renderTierEditor();
-  } catch(e) { toast(e.message,'err'); }
+    renderSessionTierEditor();
+  } catch(e) { toast(e.message, 'err'); }
 }
+
+
 
 // ── ADMIN PHOTOS ──────────────────────────────────────────────────────────────
 async function loadAdminStats() {
@@ -505,14 +780,12 @@ async function loadPhotos() {
         <td>${i+1}</td><td><img src="/photos/${p.filename}" alt=""></td>
         <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.original_name||p.filename}</td>
         <td>${p.vote_count}</td>
-        <td><button class="set-btn" onclick="setPhoto(${p.id})">▶</button>
-            <button class="del-btn" onclick="deletePhoto(${p.id})">✕</button></td>
+        <td><button class="del-btn" onclick="deletePhoto(${p.id})">✕</button></td>
       </tr>`).join('');
   } catch(e) { toast(e.message,'err'); }
 }
-async function setPhoto(id) { await req('POST',`/api/admin/set-photo/${id}`); toast('Поставлено','ok'); }
 async function deletePhoto(id) {
-  if (!confirm('Удалить?')) return;
+  if (!confirm('Удалить? Фото будет удалено из всех сессий, включая уже идущие.')) return;
   try { await req('DELETE',`/api/admin/photos/${id}`); toast('Удалено','ok'); loadPhotos(); }
   catch(e) { toast(e.message,'err'); }
 }
@@ -553,10 +826,6 @@ function setUpProgress(p,l){document.getElementById('up-fill').style.width=p+'%'
 // ── TIERLIST ──────────────────────────────────────────────────────────────────
 // Cache tierlist data for export
 let tierlistData = null;
-let allTierlistTags = [];      // [{id, name}] — все теги оценённых фото
-let activeTierTagIds = new Set(); // выбранные id тегов для фильтра (включить)
-let excludedTierTagIds = new Set(); // исключённые id тегов
-let filteredTagSearch = '';    // поисковый запрос в панели тегов
 
 function textColorFor(hex) {
   const h = hex.replace('#','');
@@ -564,89 +833,10 @@ function textColorFor(hex) {
   return (0.299*r+0.587*g+0.114*b)/255 > 0.55 ? '#1a1a1a' : '#ffffff';
 }
 
-async function loadTierlistTags() {
-  try {
-    const tags = await req('GET', '/api/tierlist/tags');
-    allTierlistTags = tags;
-    renderTierlistTagPanel();
-  } catch(e) {
-    document.getElementById('tl-tag-list').innerHTML = '<span class="tl-tags-loading">Теги недоступны</span>';
-  }
-}
-
-function renderTierlistTagPanel() {
-  const list = document.getElementById('tl-tag-list');
-  const clearBtn = document.getElementById('tl-filter-clear');
-  const hint = document.getElementById('tl-filter-hint');
-
-  const query = filteredTagSearch.toLowerCase();
-  const visible = allTierlistTags.filter(t =>
-    !query || t.name.toLowerCase().includes(query)
-  );
-
-  if (!allTierlistTags.length) {
-    list.innerHTML = '<span class="tl-tags-loading">Нет тегов</span>';
-    clearBtn.style.display = 'none';
-    hint.textContent = '';
-    return;
-  }
-
-  const hasFilter = activeTierTagIds.size || excludedTierTagIds.size;
-  clearBtn.style.display = hasFilter ? '' : 'none';
-
-  const parts = [];
-  if (activeTierTagIds.size) parts.push(`✅ включено: ${activeTierTagIds.size}`);
-  if (excludedTierTagIds.size) parts.push(`🚫 исключено: ${excludedTierTagIds.size}`);
-  hint.textContent = parts.length ? parts.join(' · ') : 'Клик — включить, ещё раз — исключить';
-
-  list.innerHTML = visible.map(t => {
-    const included = activeTierTagIds.has(t.id);
-    const excluded = excludedTierTagIds.has(t.id);
-    const cls = included ? 'active' : excluded ? 'excluded' : '';
-    const prefix = included ? '✅ ' : excluded ? '🚫 ' : '';
-    return `<button class="tl-tag-chip ${cls}"
-      onclick="toggleTierTag(${t.id})" title="${excluded ? 'Исключить' : included ? 'Снять' : 'Включить'}">${prefix}${t.name}</button>`;
-  }).join('') || '<span class="tl-tags-loading">Ничего не найдено</span>';
-}
-
-function filterTagSearch(val) {
-  filteredTagSearch = val;
-  renderTierlistTagPanel();
-}
-
-function toggleTierTag(id) {
-  if (activeTierTagIds.has(id)) {
-    // включён → исключить
-    activeTierTagIds.delete(id);
-    excludedTierTagIds.add(id);
-  } else if (excludedTierTagIds.has(id)) {
-    // исключён → нейтральный
-    excludedTierTagIds.delete(id);
-  } else {
-    // нейтральный → включить
-    activeTierTagIds.add(id);
-  }
-  renderTierlistTagPanel();
-  loadTierlist();
-}
-
-function clearTagFilter() {
-  activeTierTagIds.clear();
-  excludedTierTagIds.clear();
-  renderTierlistTagPanel();
-  loadTierlist();
-}
-
 async function loadTierlist() {
+  if (!currentSessionId) return;
   try {
-    const tagParam = [...activeTierTagIds].join(',');
-    const excludeParam = [...excludedTierTagIds].join(',');
-    let url = '/api/tierlist';
-    const params = [];
-    if (tagParam) params.push(`tag_ids=${tagParam}`);
-    if (excludeParam) params.push(`exclude_tag_ids=${excludeParam}`);
-    if (params.length) url += '?' + params.join('&');
-    const data = await req('GET', url);
+    const data = await req('GET', `/api/sessions/${currentSessionId}/tierlist`);
     tierlistData = data;
     const tierMap = data.tier_map || {};
     const container = document.getElementById('tierlist-container');
@@ -674,9 +864,7 @@ async function loadTierlist() {
     const emptyEl = document.getElementById('tierlist-empty');
     if (!hasAny) {
       emptyEl.style.display = '';
-      emptyEl.innerHTML = (activeTierTagIds.size || excludedTierTagIds.size)
-        ? `<div style="font-size:3rem">🔍</div><p>Нет фото с выбранными тегами.</p>`
-        : `<div style="font-size:3rem">⏳</div><p>Пока нет оценённых фотографий.</p>`;
+      emptyEl.innerHTML = `<div style="font-size:3rem">⏳</div><p>Пока нет оценённых фотографий.</p>`;
     } else {
       emptyEl.style.display = 'none';
     }
@@ -684,42 +872,222 @@ async function loadTierlist() {
 }
 
 function showTierlist() {
+  if (!currentSessionId) return;
   clearPolling();
   showScreen('tierlist');
-  activeTierTagIds.clear();
-  excludedTierTagIds.clear();
-  filteredTagSearch = '';
-  const searchInput = document.getElementById('tl-filter-search');
-  if (searchInput) searchInput.value = '';
-  loadTierlistTags();
+  document.getElementById('tierlist-nav-session-title').textContent = currentSessionInfo?.title || '';
   loadTierlist();
+}
+
+// ── GALLERY (просмотр всех фото вне сессий, без оценок/тегов) ───────────────
+
+let galleryTagsCache = [];
+let gallerySelectedTagId = null;
+
+function showGallery() {
+  clearPolling();
+  currentSessionId = null;
+  showScreen('gallery');
+  document.getElementById('gallery-nav-username').textContent = me?.username || '';
+  document.getElementById('btn-publish-tierlist').style.display = me?.is_admin ? '' : 'none';
+  gallerySelectedTagId = null;
+  document.getElementById('gallery-tag-search').value = '';
+  document.getElementById('gallery-show-ai-check').checked = false;
+  loadGalleryTags();
+  loadGalleryPhotos();
+}
+
+function galleryShowAi() {
+  return document.getElementById('gallery-show-ai-check').checked;
+}
+
+async function loadGalleryPhotos() {
+  const grid = document.getElementById('gallery-grid');
+  const emptyEl = document.getElementById('gallery-empty');
+  grid.innerHTML = '';
+  emptyEl.style.display = 'none';
+  try {
+    const params = new URLSearchParams();
+    if (gallerySelectedTagId) params.set('tag_id', gallerySelectedTagId);
+    if (galleryShowAi()) params.set('include_suggestions', 'true');
+    const photos = await req('GET', `/api/gallery/photos?${params.toString()}`);
+    if (!photos.length) {
+      emptyEl.style.display = '';
+      return;
+    }
+    grid.innerHTML = photos.map(p => `
+      <div class="gallery-photo" onclick="openGalleryPhotoModal(${p.id},'${p.filename}')" title="Нажмите для просмотра">
+        <img src="/photos/${p.filename}" alt="" loading="lazy">
+      </div>`).join('');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+function openGalleryPhotoModal(photoId, filename) {
+  // Лёгкая версия модалки без оценок/тегов — галерея вне сессий принципиально
+  // не показывает кто и как оценил, только сам снимок крупным планом.
+  const modal = document.getElementById('photo-modal');
+  const img = document.getElementById('modal-img');
+  const fname = document.getElementById('modal-filename');
+  const votesEl = document.getElementById('modal-votes');
+  const tagsEl = document.getElementById('modal-tags');
+  img.src = `/photos/${filename}`;
+  fname.textContent = '';
+  votesEl.innerHTML = '<div class="modal-loading">Галерея — оценки и теги недоступны вне сессии</div>';
+  tagsEl.innerHTML = '';
+  modal.style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+}
+
+async function loadGalleryTags() {
+  const list = document.getElementById('gallery-tag-list');
+  try {
+    galleryTagsCache = await req('GET', `/api/gallery/tags?include_suggestions=${galleryShowAi()}`);
+    renderGalleryTagPanel('');
+    loadGalleryPhotos();
+  } catch {
+    list.innerHTML = '<span class="tl-tags-loading">Теги недоступны</span>';
+  }
+}
+
+function renderGalleryTagPanel(query) {
+  const list = document.getElementById('gallery-tag-list');
+  const clearBtn = document.getElementById('gallery-filter-clear');
+  const hint = document.getElementById('gallery-filter-hint');
+  const q = (query || '').trim().toLowerCase();
+  const visible = galleryTagsCache.filter(t => !q || t.name.toLowerCase().includes(q));
+
+  if (!galleryTagsCache.length) {
+    list.innerHTML = '<span class="tl-tags-loading">Тегов пока нет</span>';
+    clearBtn.style.display = 'none';
+    hint.textContent = '';
+    return;
+  }
+
+  clearBtn.style.display = gallerySelectedTagId ? '' : 'none';
+  hint.textContent = gallerySelectedTagId
+    ? galleryTagsCache.find(t => t.id === gallerySelectedTagId)?.name || ''
+    : 'Выберите тег';
+
+  list.innerHTML = visible.map(t => `
+    <button class="tl-tag-chip ${t.id === gallerySelectedTagId ? 'active' : ''}"
+      onclick="selectGalleryTag(${t.id})">${!t.has_confirmed ? '🤖 ' : ''}${escapeHtml(t.name)} <span style="opacity:.7">${t.photo_count}</span></button>
+  `).join('') || '<span class="tl-tags-loading">Ничего не найдено</span>';
+}
+
+function selectGalleryTag(tagId) {
+  gallerySelectedTagId = gallerySelectedTagId === tagId ? null : tagId;
+  renderGalleryTagPanel(document.getElementById('gallery-tag-search').value);
+  loadGalleryPhotos();
+}
+
+function clearGalleryTagFilter() {
+  gallerySelectedTagId = null;
+  document.getElementById('gallery-tag-search').value = '';
+  renderGalleryTagPanel('');
+  loadGalleryPhotos();
+}
+
+// ── PUBLISHED TIERLIST (отдельная вкладка) ──────────────────────────────────
+
+function showPublishedTierlist() {
+  clearPolling();
+  showScreen('published-tierlist');
+  document.getElementById('btn-publish-tierlist-2').style.display = me?.is_admin ? '' : 'none';
+  loadPublishedTierlist();
+}
+
+async function loadPublishedTierlist() {
+  const content = document.getElementById('published-tierlist-content');
+  content.innerHTML = '<div class="stats-loading">Загрузка...</div>';
+  try {
+    const data = await req('GET', '/api/gallery/published-tierlist');
+    if (!data) {
+      content.innerHTML = `
+        <div class="empty-state" style="margin-top:2rem">
+          <div style="font-size:3rem">🏆</div>
+          <p>Пока ничего не опубликовано.</p>
+          ${me?.is_admin ? '<p class="sub">Нажмите 📌 в шапке, чтобы выбрать сессию для публикации.</p>' : ''}
+        </div>`;
+      return;
+    }
+    const tierMap = data.tier_map || {};
+    const rowsHtml = data.tier_order.map(tid => {
+      const photos = data.tiers[tid] || [];
+      const info = tierMap[tid] || {label: tid, color: '#888'};
+      const textColor = textColorFor(info.color);
+      return `<div class="published-tier-row">
+        <div class="tier-label" style="background:${info.color};color:${textColor}">
+          <span class="tier-name-full">${info.label}</span>
+        </div>
+        <div class="tier-photos">
+          ${photos.length
+            ? photos.map(p=>`<div class="tier-photo" onclick="openGalleryPhotoModal(${p.id},'${p.filename}')">
+                <img src="/photos/${p.filename}" alt="" loading="lazy">
+                <div class="score-badge" style="background:${info.color};color:${textColor}">${p.vote_count}✓</div>
+              </div>`).join('')
+            : '<span class="tier-empty">—</span>'}
+        </div>
+      </div>`;
+    }).join('');
+
+    content.innerHTML = `
+      <div class="published-tierlist-block">
+        <div class="published-tierlist-header">
+          <span class="published-tierlist-title">🏆 ${escapeHtml(data.title || 'Тир-лист')}</span>
+          <span class="published-tierlist-meta">опубликовал ${escapeHtml(data.published_by || '?')} · ${new Date(data.published_at + 'Z').toLocaleDateString('ru')}</span>
+        </div>
+        ${rowsHtml}
+      </div>`;
+  } catch(e) {
+    content.innerHTML = `<div class="empty-state"><p>${e.message}</p></div>`;
+  }
+}
+
+async function openPublishTierlistModal() {
+  const modal = document.getElementById('publish-tierlist-modal');
+  const list = document.getElementById('publishable-sessions-list');
+  list.innerHTML = '<div class="sessions-empty">Загрузка...</div>';
+  modal.style.display = 'flex';
+  try {
+    const sessions = await req('GET', '/api/admin/publishable-sessions');
+    if (!sessions.length) {
+      list.innerHTML = '<div class="sessions-empty">Сессий пока нет</div>';
+      return;
+    }
+    list.innerHTML = sessions.map(s => `
+      <div class="session-card" onclick="publishTierlist(${s.id})">
+        <div class="session-card-main">
+          <div class="session-card-title">${escapeHtml(s.title)}</div>
+          <div class="session-card-meta">от ${escapeHtml(s.creator_username)} · оценено фото: ${s.rated_photo_count} · голосов: ${s.vote_count}</div>
+        </div>
+        <span class="session-card-badge ${s.is_active ? 'open' : 'closed'}">${s.is_active ? 'активна' : 'завершена'}</span>
+      </div>`).join('');
+  } catch (e) {
+    list.innerHTML = `<div class="sessions-empty">${e.message}</div>`;
+  }
+}
+
+async function publishTierlist(sessionId) {
+  try {
+    await req('POST', `/api/admin/publish-tierlist/${sessionId}`);
+    document.getElementById('publish-tierlist-modal').style.display = 'none';
+    toast('Тир-лист опубликован!', 'ok');
+    loadPublishedTierlist();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 // ── EXPORT ────────────────────────────────────────────────────────────────────
 
 function getExportFilename(ext) {
-  const hasFilt = activeTierTagIds.size || excludedTierTagIds.size;
-  if (!hasFilt) return `tierlist.${ext}`;
-  const inclNames = [...activeTierTagIds]
-    .map(id => allTierlistTags.find(t => t.id === id)?.name || id).join('_');
-  const exclNames = [...excludedTierTagIds]
-    .map(id => allTierlistTags.find(t => t.id === id)?.name || id).map(n => 'no-'+n).join('_');
-  const combined = [inclNames, exclNames].filter(Boolean).join('_')
-    .replace(/[^a-zа-яёА-ЯЁA-Z0-9_-]/gi, '').slice(0, 40);
-  return `tierlist_${combined}.${ext}`;
+  const title = (currentSessionInfo?.title || 'tierlist')
+    .replace(/[^a-zа-яёА-ЯЁA-Z0-9_-]/gi, '_').slice(0, 40);
+  return `${title}.${ext}`;
 }
 
 async function exportCSV() {
   if (!tierlistData) { toast('Сначала загрузите тир-лист','err'); return; }
   const tierMap = tierlistData.tier_map || {};
-  const inclNote = activeTierTagIds.size
-    ? 'Включены: ' + [...activeTierTagIds].map(id => allTierlistTags.find(t=>t.id===id)?.name || id).join(', ')
-    : '';
-  const exclNote = excludedTierTagIds.size
-    ? 'Исключены: ' + [...excludedTierTagIds].map(id => allTierlistTags.find(t=>t.id===id)?.name || id).join(', ')
-    : '';
-  const tagNote = [inclNote, exclNote].filter(Boolean).join(' | ');
-  let csv = tagNote ? `# Фильтр: ${tagNote}\n` : '';
+  let csv = `# Сессия: ${currentSessionInfo?.title || ''}\n`;
   csv += 'Тир,Название файла,Голосов\n';
   tierlistData.tier_order.forEach(tid => {
     const label = tierMap[tid]?.label || tid;
@@ -761,13 +1129,7 @@ async function exportPNG() {
     allImgs[p.filename] = await loadImg(`/photos/${p.filename}`);
   })));
 
-  const inclLabel = activeTierTagIds.size
-    ? 'Включены: ' + [...activeTierTagIds].map(id => allTierlistTags.find(t=>t.id===id)?.name || '').join(', ')
-    : '';
-  const exclLabel = excludedTierTagIds.size
-    ? 'Исключены: ' + [...excludedTierTagIds].map(id => allTierlistTags.find(t=>t.id===id)?.name || '').join(', ')
-    : '';
-  const tagLabel = [inclLabel, exclLabel].filter(Boolean).join('  |  ');
+  const tagLabel = currentSessionInfo?.title || '';
 
   const maxPhotosPerRow = Math.max(...rows.map(r=>r.photos.length));
   const rowH = THUMB + PAD*2;
@@ -849,11 +1211,11 @@ function toggleVotesList() {
 }
 
 async function loadVotesList() {
-  if (!currentPhotoId) return;
+  if (!currentPhotoId || !currentSessionId) return;
   const list = document.getElementById('votes-list');
   list.innerHTML = '<div class="votes-loading">Загрузка...</div>';
   try {
-    const votes = await req('GET', `/api/photo-votes/${currentPhotoId}`);
+    const votes = await req('GET', `/api/sessions/${currentSessionId}/photo-votes/${currentPhotoId}`);
     if (!votes.length) {
       list.innerHTML = '<div class="votes-empty">Никто ещё не проголосовал</div>';
       return;
@@ -884,14 +1246,23 @@ let compareUserId = null;
 let usersList = [];
 
 function showStats() {
+  if (!currentSessionId) return;
   clearPolling();
   showScreen('stats');
+  document.getElementById('stats-nav-session-title').textContent = currentSessionInfo?.title || '';
+  selectedUserId = null; compareUserId = null;
+  document.getElementById('stats-content').innerHTML = `
+    <div class="stats-placeholder">
+      <div style="font-size:3rem">👆</div>
+      <p>Выберите участника чтобы увидеть статистику</p>
+    </div>`;
   loadUsersList();
 }
 
 async function loadUsersList() {
+  if (!currentSessionId) return;
   try {
-    usersList = await req('GET', '/api/users-list');
+    usersList = await req('GET', `/api/sessions/${currentSessionId}/users-list`);
     const el = document.getElementById('users-list');
     if (!usersList.length) {
       el.innerHTML = '<div class="stats-empty">Нет участников</div>';
@@ -918,10 +1289,11 @@ async function selectUser(uid) {
 }
 
 async function loadUserProfile(uid) {
+  if (!currentSessionId) return;
   const el = document.getElementById('stats-content');
   el.innerHTML = '<div class="stats-loading">Загрузка...</div>';
   try {
-    const d = await req('GET', `/api/user-stats/${uid}`);
+    const d = await req('GET', `/api/sessions/${currentSessionId}/user-stats/${uid}`);
     const totalVotes = d.total_votes;
 
     const tierBars = d.tier_counts.map(t => {
@@ -990,6 +1362,7 @@ async function loadUserProfile(uid) {
 }
 
 async function loadCompare(uid1, uid2) {
+  if (!currentSessionId) return;
   compareUserId = uid2;
   // re-render compare buttons
   document.querySelectorAll('.compare-btn').forEach(btn => {
@@ -999,7 +1372,7 @@ async function loadCompare(uid1, uid2) {
   if (!el) return;
   el.innerHTML = '<div class="stats-loading" style="margin-top:10px">Загрузка...</div>';
   try {
-    const d = await req('GET', `/api/compare/${uid1}/${uid2}`);
+    const d = await req('GET', `/api/sessions/${currentSessionId}/compare/${uid1}/${uid2}`);
     const simColor = d.similarity >= 70 ? 'var(--success)' : d.similarity >= 40 ? 'var(--accent)' : 'var(--danger)';
 
     const disHtml = d.disagreements.length ? d.disagreements.map(p => `
@@ -1034,6 +1407,7 @@ async function loadCompare(uid1, uid2) {
 // ── PHOTO MODAL ───────────────────────────────────────────────────────────────
 
 async function openPhotoModal(photoId, filename) {
+  if (!currentSessionId) return;
   const modal = document.getElementById('photo-modal');
   const img = document.getElementById('modal-img');
   const fname = document.getElementById('modal-filename');
@@ -1048,7 +1422,7 @@ async function openPhotoModal(photoId, filename) {
   document.body.style.overflow = 'hidden';
 
   try {
-    const d = await req('GET', `/api/photo-detail/${photoId}`);
+    const d = await req('GET', `/api/sessions/${currentSessionId}/photo-detail/${photoId}`);
     fname.textContent = d.photo.original_name || d.photo.filename;
 
     // votes
