@@ -303,35 +303,40 @@
         <button class="nav-btn" onclick="logout()" title="Выйти">⏻</button>
       </nav>
     </header>
-    <main class="tierlist-main">
-      <div class="tierlist-header">
-        <div>
-          <h1 class="tierlist-title">Галерея</h1>
-          <p class="tierlist-sub">Все фото на сайте — для просмотра, без оценок и тегов</p>
+    <main class="gallery-main">
+      <div class="gallery-layout">
+        <div class="gallery-photos-col">
+          <div class="tierlist-header">
+            <div>
+              <h1 class="tierlist-title">Галерея</h1>
+              <p class="tierlist-sub">Все фото на сайте — для просмотра, без оценок и тегов</p>
+            </div>
+          </div>
+          <div id="gallery-grid" class="gallery-grid"></div>
+          <div id="gallery-empty" class="empty-state" style="display:none">
+            <div style="font-size:3rem">🖼️</div><p>Фото не найдены.</p>
+          </div>
         </div>
-      </div>
 
-      <div class="tl-filter-panel">
-        <div class="tl-filter-header">
-          <span class="tl-filter-title">🏷️ Фильтр по тегу</span>
-          <span class="tl-filter-hint" id="gallery-filter-hint">Выберите тег</span>
-          <button class="tl-filter-clear" id="gallery-filter-clear" onclick="clearGalleryTagFilter()" style="display:none">✕ Сбросить</button>
-        </div>
-        <div class="tl-filter-search-wrap">
-          <input class="tl-filter-search" id="gallery-tag-search" placeholder="Поиск тега..." oninput="renderGalleryTagPanel(this.value)" autocomplete="off">
-        </div>
-        <label class="radio-row" style="margin-bottom:10px">
-          <input type="checkbox" id="gallery-show-ai-check" onchange="loadGalleryTags()">
-          Показывать теги, предложенные AI (не подтверждены)
-        </label>
-        <div class="tl-tag-list" id="gallery-tag-list">
-          <span class="tl-tags-loading">Загрузка тегов...</span>
-        </div>
-      </div>
-
-      <div id="gallery-grid" class="gallery-grid"></div>
-      <div id="gallery-empty" class="empty-state" style="display:none">
-        <div style="font-size:3rem">🖼️</div><p>Фото не найдены.</p>
+        <aside class="gallery-sidebar">
+          <div class="tl-filter-panel">
+            <div class="tl-filter-header">
+              <span class="tl-filter-title">🏷️ Фильтр по тегу</span>
+              <button class="tl-filter-clear" id="gallery-filter-clear" onclick="clearGalleryTagFilter()" style="display:none">✕ Сбросить</button>
+            </div>
+            <span class="tl-filter-hint" id="gallery-filter-hint">Выберите тег</span>
+            <div class="tl-filter-search-wrap">
+              <input class="tl-filter-search" id="gallery-tag-search" placeholder="Поиск тега..." oninput="renderGalleryTagPanel(this.value)" autocomplete="off">
+            </div>
+            <label class="radio-row" style="margin-bottom:10px">
+              <input type="checkbox" id="gallery-show-ai-check" onchange="loadGalleryTags()">
+              Показывать теги, предложенные AI (не подтверждены)
+            </label>
+            <div class="tl-tag-list" id="gallery-tag-list">
+              <span class="tl-tags-loading">Загрузка тегов...</span>
+            </div>
+          </div>
+        </aside>
       </div>
     </main>
   </div>

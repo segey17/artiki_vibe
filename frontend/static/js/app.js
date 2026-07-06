@@ -922,9 +922,12 @@ async function loadGalleryPhotos() {
   } catch(e) { toast(e.message, 'err'); }
 }
 
-function openGalleryPhotoModal(photoId, filename) {
-  // Лёгкая версия модалки без оценок/тегов — галерея вне сессий принципиально
-  // не показывает кто и как оценил, только сам снимок крупным планом.
+async function openGalleryPhotoModal(photoId, filename) {
+  // Лёгкая версия модалки без оценок — галерея вне сессий принципиально
+  // не показывает кто и как оценил (это привязано к конкретной сессии).
+  // Теги при этом глобальны для фото, поэтому их показываем, включая
+  // возможность подтвердить AI-предложение — но без добавления своих тегов.
+  galleryModalPhotoId = photoId;
   const modal = document.getElementById('photo-modal');
   const img = document.getElementById('modal-img');
   const fname = document.getElementById('modal-filename');
@@ -932,10 +935,56 @@ function openGalleryPhotoModal(photoId, filename) {
   const tagsEl = document.getElementById('modal-tags');
   img.src = `/photos/${filename}`;
   fname.textContent = '';
-  votesEl.innerHTML = '<div class="modal-loading">Галерея — оценки и теги недоступны вне сессии</div>';
-  tagsEl.innerHTML = '';
+  votesEl.innerHTML = '<div class="modal-loading">Оценки участников доступны только внутри сессии</div>';
+  tagsEl.innerHTML = '<div class="modal-loading">Загрузка тегов...</div>';
   modal.style.display = 'flex';
   document.body.style.overflow = 'hidden';
+  await loadGalleryModalTags();
+}
+
+async function loadGalleryModalTags() {
+  if (!galleryModalPhotoId) return;
+  const tagsEl = document.getElementById('modal-tags');
+  try {
+    const data = await req('GET', `/api/photo-tags/${galleryModalPhotoId}`);
+    const confirmed = {};
+    (data.all || []).filter(r => !r.is_suggestion).forEach(r => {
+      if (!confirmed[r.tag_name]) confirmed[r.tag_name] = [];
+      confirmed[r.tag_name].push(r.username);
+    });
+    const confirmedHtml = Object.entries(confirmed).map(([name, users]) => `
+      <span class="tag-chip other" style="cursor:default" title="${users.join(', ')}: ${name}">
+        ${name} <span class="tag-users">${users.length}</span>
+      </span>`).join('');
+
+    const suggestions = (data.all || []).filter(r => r.is_suggestion);
+    const suggestionsHtml = suggestions.map(r => `
+      <span class="tag-chip suggestion" title="Предложено автотегированием — подтвердите или отклоните">
+        <span class="ai-badge">AI</span> ${r.tag_name}
+        <span class="tag-confirm" onclick="confirmGalleryTag(${r.tag_id})" title="Подтвердить">✓</span>
+        <span class="tag-reject" onclick="rejectGalleryTag(${r.tag_id})" title="Отклонить">✕</span>
+      </span>`).join('');
+
+    tagsEl.innerHTML = (confirmedHtml + suggestionsHtml) || '<div class="modal-empty">Нет тегов</div>';
+  } catch(e) {
+    tagsEl.innerHTML = '<div class="modal-empty">Ошибка загрузки тегов</div>';
+  }
+}
+
+async function confirmGalleryTag(tagId) {
+  if (!galleryModalPhotoId) return;
+  try {
+    await formReq(`/api/photo-tags/${galleryModalPhotoId}/confirm`, { tag_id: tagId });
+    loadGalleryModalTags();
+  } catch(e) { toast(e.message || 'Ошибка', 'err'); }
+}
+
+async function rejectGalleryTag(tagId) {
+  if (!galleryModalPhotoId) return;
+  try {
+    await formReq(`/api/photo-tags/${galleryModalPhotoId}/reject`, { tag_id: tagId });
+    loadGalleryModalTags();
+  } catch(e) { toast(e.message || 'Ошибка', 'err'); }
 }
 
 async function loadGalleryTags() {
@@ -1457,6 +1506,7 @@ async function openPhotoModal(photoId, filename) {
 function closePhotoModal() {
   document.getElementById('photo-modal').style.display = 'none';
   document.body.style.overflow = '';
+  galleryModalPhotoId = null;
 }
 
 function closeModal(e) {
@@ -1470,6 +1520,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closePhotoMo
 // ── TAGS ──────────────────────────────────────────────────────────────────────
 let myTags = [];        // tag objects {id, name} set by current user
 let allPhotoTags = [];  // all users tags [{username, tag_name, tag_id}]
+let galleryModalPhotoId = null; // id фото, открытого в модалке галереи (для confirm/reject AI-тегов)
 let dropdownVisible = false;
 
 async function loadTags() {
