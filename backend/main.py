@@ -2385,9 +2385,10 @@ def stats(user=Depends(current_user)):
 def reset_db(user=Depends(admin_user)):
     """
     Полный сброс сайта: удаляет всех обычных пользователей, все фото с диска,
-    все голоса, теги и ВСЕ сессии (включая активные). Это разрушительная
-    операция уровня всего сайта — доступна только сайт-админу, не владельцам
-    отдельных сессий (для завершения своей сессии есть /api/sessions/{id}/end).
+    все голоса, теги, ВСЕ сессии (включая активные) и опубликованный на
+    главной странице тир-лист. Это разрушительная операция уровня всего
+    сайта — доступна только сайт-админу, не владельцам отдельных сессий
+    (для завершения своей сессии есть /api/sessions/{id}/end).
     """
     db = get_db()
     # delete all non-admin users
@@ -2402,6 +2403,7 @@ def reset_db(user=Depends(admin_user)):
     db.execute("DELETE FROM photo_tags")
     db.execute("DELETE FROM session_photos")
     db.execute("DELETE FROM sessions")
+    db.execute("DELETE FROM published_tierlist")
     db.commit()
     db.close()
     return {"ok": True}
