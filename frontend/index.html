@@ -24,7 +24,7 @@
   <!-- AUTH -->
   <div id="screen-auth" class="screen active">
     <div class="auth-bg"></div>
-    <button class="nav-btn auth-theme-toggle theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
+    <button class="nav-btn auth-theme-toggle theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
     <div class="auth-card">
       <div class="logo">PHOTO<span>RANK</span></div>
       <div class="auth-tabs">
@@ -52,10 +52,10 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <span id="sessions-nav-username"></span>
-        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
-        <button class="nav-btn" onclick="showGallery()" title="Галерея">🖼️</button>
-        <button class="nav-btn" onclick="showPhotoManager()" title="Управление фото">📁</button>
-        <button class="nav-btn" onclick="logout()" title="Выйти">⏻</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
+        <button class="nav-btn" onclick="showGallery()">Галерея</button>
+        <button class="nav-btn photo-manager-nav-btn" onclick="showPhotoManager()" style="display:none">Управление фото</button>
+        <button class="nav-btn" onclick="logout()">Выйти</button>
       </nav>
     </header>
     <main class="sessions-main">
@@ -65,8 +65,7 @@
       </div>
 
       <div class="sessions-join-row">
-        <input type="text" id="join-code-input" placeholder="Код сессии..." class="yadisk-input" style="max-width:240px">
-        <button class="btn-secondary" onclick="joinByCode()">Войти по коду</button>
+        <input type="text" id="session-search-input" placeholder="Поиск сессии по названию..." class="yadisk-input" oninput="renderSessionsList(this.value)">
       </div>
 
       <div id="sessions-list" class="sessions-list"></div>
@@ -79,7 +78,7 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <button class="nav-btn" onclick="showSessionsList()">← Назад</button>
-        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
       </nav>
     </header>
     <main class="admin-main">
@@ -125,12 +124,12 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <span id="nav-session-title"></span>
-        <button class="nav-btn theme-toggle-icon-target" id="theme-toggle-btn" onclick="toggleTheme()" title="Тема">🌙</button>
-        <button class="nav-btn" onclick="showTierlist()" title="Тир-лист">🏆</button>
-        <button class="nav-btn" onclick="showStats()" title="Статистика">📊</button>
-        <button class="nav-btn" id="btn-session-admin" onclick="showSessionAdmin()" title="Настройки сессии" style="display:none">⚙️</button>
-        <button class="nav-btn" onclick="showSessionsList()" title="К списку сессий">☰</button>
-        <button class="nav-btn" onclick="logout()" title="Выйти">⏻</button>
+        <button class="nav-btn theme-toggle-icon-target" id="theme-toggle-btn" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
+        <button class="nav-btn" onclick="showTierlist()">Тир-лист</button>
+        <button class="nav-btn" onclick="showStats()">Статистика</button>
+        <button class="nav-btn" id="btn-session-admin" onclick="showSessionAdmin()" title="Настройки сессии" style="display:none">Настройки</button>
+        <button class="nav-btn" onclick="showSessionsList()">К сессиям</button>
+        <button class="nav-btn" onclick="logout()">Выйти</button>
       </nav>
     </header>
     <main class="vote-main">
@@ -183,7 +182,6 @@
             <div class="admin-bar-btns">
               <button class="admin-btn" onclick="prevPhoto()" title="← или стрелка влево">← Назад</button>
               <button class="admin-btn accent" onclick="nextPhoto()" title="→ или стрелка вправо">Вперёд →</button>
-              <button class="admin-btn" onclick="closeVoting()">🔒 Закрыть голос.</button>
               <button class="admin-btn" onclick="shufflePhotos()" title="Перемешать все фото случайно">🔀 Перемешать</button>
               <button class="admin-btn" id="auto-advance-btn" onclick="toggleAutoAdvance()" title="Авто-переход когда все онлайн проголосовали">⚡ Авто-переход</button>
             </div>
@@ -202,8 +200,8 @@
       <nav class="topbar-nav">
         <span id="tierlist-nav-session-title"></span>
         <button class="nav-btn" onclick="showVote()">← Назад</button>
-        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
-        <button class="nav-btn" onclick="logout()">⏻</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
+        <button class="nav-btn" onclick="logout()">Выйти</button>
       </nav>
     </header>
     <main class="tierlist-main">
@@ -233,8 +231,8 @@
       <nav class="topbar-nav">
         <span id="stats-nav-session-title"></span>
         <button class="nav-btn" onclick="showVote()">← Назад</button>
-        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
-        <button class="nav-btn" onclick="logout()">⏻</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
+        <button class="nav-btn" onclick="logout()">Выйти</button>
       </nav>
     </header>
     <main class="stats-main">
@@ -264,7 +262,7 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <button class="nav-btn" onclick="showVote()">← Назад</button>
-        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
       </nav>
     </header>
     <main class="admin-main">
@@ -295,23 +293,17 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <span id="gallery-nav-username"></span>
-        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
-        <button class="nav-btn" onclick="showPublishedTierlist()" title="Официальный тир-лист">🏆</button>
-        <button class="nav-btn" onclick="showSessionsList()" title="Сессии оценивания">🎬</button>
-        <button class="nav-btn" onclick="showPhotoManager()" title="Управление фото">📁</button>
-        <button class="nav-btn" id="btn-publish-tierlist" onclick="openPublishTierlistModal()" title="Опубликовать тир-лист сессии" style="display:none">📌</button>
-        <button class="nav-btn" onclick="logout()" title="Выйти">⏻</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
+        <button class="nav-btn" onclick="showPublishedTierlist()">Тир-лист</button>
+        <button class="nav-btn" onclick="showSessionsList()">Сессии</button>
+        <button class="nav-btn photo-manager-nav-btn" onclick="showPhotoManager()" style="display:none">Управление фото</button>
+        <button class="nav-btn" id="btn-publish-tierlist" onclick="openPublishTierlistModal()" title="Опубликовать тир-лист сессии" style="display:none">Опубликовать</button>
+        <button class="nav-btn" onclick="logout()">Выйти</button>
       </nav>
     </header>
     <main class="gallery-main">
       <div class="gallery-layout">
         <div class="gallery-photos-col">
-          <div class="tierlist-header">
-            <div>
-              <h1 class="tierlist-title">Галерея</h1>
-              <p class="tierlist-sub">Все фото на сайте — для просмотра, без оценок и тегов</p>
-            </div>
-          </div>
           <div id="gallery-grid" class="gallery-grid"></div>
           <div id="gallery-empty" class="empty-state" style="display:none">
             <div style="font-size:3rem">🖼️</div><p>Фото не найдены.</p>
@@ -339,6 +331,16 @@
         </aside>
       </div>
     </main>
+
+    <div class="gallery-issue-bar">
+      <button class="issue-nav-btn" id="gallery-prev-btn" onclick="galleryGoPage(galleryPage - 1)" title="Предыдущий выпуск">◀</button>
+      <div class="issue-info">
+        <span class="issue-title">Выпуск <span id="gallery-issue-num">1</span> из <span id="gallery-issue-total">1</span></span>
+        <span class="issue-sub" id="gallery-issue-sub">показано 0 из 0</span>
+      </div>
+      <button class="issue-nav-btn" id="gallery-next-btn" onclick="galleryGoPage(galleryPage + 1)" title="Следующий выпуск">▶</button>
+      <button class="issue-shuffle-btn" onclick="galleryRandomPage()" title="Случайный выпуск">🎲 Случайный выпуск</button>
+    </div>
   </div>
 
   <!-- PUBLISHED TIERLIST (отдельная вкладка — официальный тир-лист, опубликованный админом) -->
@@ -347,8 +349,8 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <button class="nav-btn" onclick="showGallery()" title="К галерее">← Назад</button>
-        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
-        <button class="nav-btn" id="btn-publish-tierlist-2" onclick="openPublishTierlistModal()" title="Опубликовать тир-лист сессии" style="display:none">📌</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
+        <button class="nav-btn" id="btn-publish-tierlist-2" onclick="openPublishTierlistModal()" title="Опубликовать тир-лист сессии" style="display:none">Опубликовать</button>
       </nav>
     </header>
     <main class="tierlist-main">
@@ -380,7 +382,7 @@
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
         <button class="nav-btn" onclick="showGallery()">← Назад</button>
-        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Тема">🌙</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
       </nav>
     </header>
     <main class="admin-main">
@@ -400,11 +402,19 @@
         </div>
 
         <div class="admin-card">
-          <h2>🧹 Дубли фото</h2>
+          <h2>🧹 Дубли фото (по имени файла)</h2>
           <p class="hint">Если авто-синхронизация запускалась параллельно сама с собой (например, фоновый таймер и ручная проверка совпали по времени), могли появиться задвоенные копии одного и того же фото. Голоса и теги при объединении переносятся на оставшуюся копию, а не теряются.</p>
           <div id="duplicate-status" class="hint">Проверка...</div>
           <button class="btn-secondary" onclick="checkDuplicatePhotos()">Проверить дубли</button>
           <button class="btn-danger" id="merge-duplicates-btn" onclick="mergeDuplicatePhotos()" style="display:none">Объединить дубли</button>
+        </div>
+
+        <div class="admin-card">
+          <h2>🖼️ Дубли по содержимому картинки</h2>
+          <p class="hint">Находит одно и то же изображение, загруженное под разными именами (даже в другом формате или размере) — сравнивается сама картинка, а не имя файла. В отличие от проверки выше — не запускается автоматически: на первый раз нужно посчитать хеш каждого фото, это может занять время, поэтому только по кнопке.</p>
+          <div id="duplicate-image-status" class="hint">Нажмите «Проверить», чтобы просканировать фото.</div>
+          <button class="btn-secondary" onclick="checkDuplicatePhotosByImage()">Проверить по картинке</button>
+          <button class="btn-danger" id="merge-duplicates-image-btn" onclick="mergeDuplicatePhotosByImage()" style="display:none">Объединить дубли</button>
         </div>
 
         <div class="admin-card">
@@ -532,7 +542,7 @@
       <div class="modal-info">
         <div class="modal-filename" id="modal-filename"></div>
 
-        <div class="modal-section-title">Оценки участников</div>
+        <div class="modal-section-title" id="modal-votes-title">Оценки участников</div>
         <div id="modal-votes" class="modal-votes"></div>
 
         <div class="modal-section-title" style="margin-top:12px">Теги</div>

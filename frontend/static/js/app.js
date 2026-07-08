@@ -17,7 +17,7 @@ let autoAdvanceEnabled = false;
 function applyThemeIcons() {
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   document.querySelectorAll('.theme-toggle-icon-target')
-    .forEach(btn => { btn.textContent = isDark ? '☀️' : '🌙'; });
+    .forEach(btn => { btn.textContent = isDark ? 'Светлая тема' : 'Тёмная тема'; });
 }
 function toggleTheme() {
   const root = document.documentElement;
@@ -112,6 +112,7 @@ function showSessionsList() {
   currentSessionId = null;
   showScreen('sessions');
   document.getElementById('sessions-nav-username').textContent = me?.username || '';
+  document.querySelectorAll('.photo-manager-nav-btn').forEach(b => b.style.display = me?.is_admin ? '' : 'none');
   loadSessionsList();
   try { history.replaceState(null, '', location.pathname); } catch {}
 }
@@ -144,6 +145,7 @@ function showSessionAdmin() {
 }
 
 function showPhotoManager() {
+  if (!me?.is_admin) { toast('Доступно только администраторам сайта', 'err'); return; }
   clearPolling();
   showScreen('photo-manager');
   document.getElementById('reset-db-card').style.display = me?.is_admin ? '' : 'none';
@@ -199,35 +201,41 @@ function logout() {
 }
 
 // ── SESSIONS LIST & CREATE ───────────────────────────────────────────────────
+let allSessionsCache = [];
+
 async function loadSessionsList() {
   const el = document.getElementById('sessions-list');
   el.innerHTML = '<div class="sessions-empty">Загрузка...</div>';
+  document.getElementById('session-search-input').value = '';
   try {
-    const list = await req('GET', '/api/sessions');
-    if (!list.length) {
-      el.innerHTML = '<div class="sessions-empty">Активных сессий пока нет — создайте первую.</div>';
-      return;
-    }
-    el.innerHTML = list.map(s => `
-      <div class="session-card" onclick="showVote(${s.id})">
-        <div class="session-card-main">
-          <div class="session-card-title">${escapeHtml(s.title)}</div>
-          <div class="session-card-meta">от ${escapeHtml(s.creator_username)} · ${s.photo_count} фото · ${s.participant_count} участников</div>
-        </div>
-        <span class="session-card-badge ${s.voting_open ? 'open' : 'closed'}">${s.voting_open ? 'идёт' : 'закрыта'}</span>
-      </div>`).join('');
+    allSessionsCache = await req('GET', '/api/sessions');
+    renderSessionsList('');
   } catch (e) {
     el.innerHTML = `<div class="sessions-empty">Ошибка загрузки: ${e.message}</div>`;
   }
 }
 
-async function joinByCode() {
-  const code = document.getElementById('join-code-input').value.trim();
-  if (!code) { toast('Введите код сессии', 'err'); return; }
-  try {
-    const r = await req('GET', `/api/sessions/by-code/${encodeURIComponent(code)}`);
-    showVote(r.session_id);
-  } catch (e) { toast(e.message || 'Сессия не найдена', 'err'); }
+function renderSessionsList(filterText) {
+  const el = document.getElementById('sessions-list');
+  const q = (filterText || '').trim().toLowerCase();
+  const list = q ? allSessionsCache.filter(s => s.title.toLowerCase().includes(q)) : allSessionsCache;
+
+  if (!allSessionsCache.length) {
+    el.innerHTML = '<div class="sessions-empty">Активных сессий пока нет — создайте первую.</div>';
+    return;
+  }
+  if (!list.length) {
+    el.innerHTML = `<div class="sessions-empty">По запросу «${escapeHtml(filterText)}» ничего не найдено.</div>`;
+    return;
+  }
+  el.innerHTML = list.map(s => `
+    <div class="session-card" onclick="showVote(${s.id})">
+      <div class="session-card-main">
+        <div class="session-card-title">${escapeHtml(s.title)}</div>
+        <div class="session-card-meta">от ${escapeHtml(s.creator_username)} · ${s.photo_count} фото · ${s.participant_count} участников</div>
+      </div>
+      <span class="session-card-badge ${s.voting_open ? 'open' : 'closed'}">${s.voting_open ? 'идёт' : 'закрыта'}</span>
+    </div>`).join('');
 }
 
 let newSessionTiers = [];
@@ -245,7 +253,8 @@ function openCreateSessionForm() {
 
 let allTagsForSessionCreate = [];      // топ-10 тегов от /api/tierlist/tags (с превью, is_favorite, has_confirmed)
 let allPhotosPreview = null;           // {filename} — случайное превью для плитки "Все фото"
-let selectedAlbumId = 'all';           // 'all' | tagId — что выбрано в сетке альбомов сейчас
+let newPhotosInfo = null;              // {count, preview_filename} — для плитки "Новые фото"
+let selectedAlbumId = 'all';           // 'all' | 'new' | tagId — что выбрано в сетке альбомов сейчас
 
 async function loadTagOptionsForSessionCreate() {
   const grid = document.getElementById('tag-card-grid');
@@ -253,12 +262,14 @@ async function loadTagOptionsForSessionCreate() {
   selectedAlbumId = 'all';
   document.getElementById('tag-card-search').value = '';
   try {
-    const [tagsList, allPreview] = await Promise.all([
+    const [tagsList, allPreview, newInfo] = await Promise.all([
       req('GET', `/api/tierlist/tags?include_suggestions=${includeSuggestionsFlag()}`),
-      allPhotosPreview ? Promise.resolve(allPhotosPreview) : req('GET', '/api/photos/random-preview')
+      allPhotosPreview ? Promise.resolve(allPhotosPreview) : req('GET', '/api/photos/random-preview'),
+      req('GET', '/api/photos/new-info')
     ]);
     allTagsForSessionCreate = tagsList;
     allPhotosPreview = allPreview;
+    newPhotosInfo = newInfo;
     renderTagCardGrid('');
   } catch {
     grid.innerHTML = '<div class="tag-card-empty">Ошибка загрузки альбомов</div>';
@@ -300,20 +311,23 @@ function renderTagCardGrid(query, searchResults) {
   // Плитка "Все фото" — всегда первая, видна и при поиске (если запрос не задан
   // или совпадает с её названием), как обычный альбом в галерее.
   const allCardMatches = !q || 'все фото'.includes(q);
+  // Плитка "Новые фото" — фото, которых ещё нет в опубликованном на главной
+  // тир-листе; идёт сразу за "Все фото", тоже участвует в поиске по названию.
+  const newCardMatches = !q || 'новые фото'.includes(q);
 
   let tagCards;
   if (!q) {
     // без поиска — витрина топ-10, уже на руках, без лимита (backend уже
-    // прислал ровно столько, сколько нужно показать); урезаем до 9, чтобы
-    // вместе с плиткой "Все фото" было ровно 10.
-    tagCards = allTagsForSessionCreate.slice(0, 9);
+    // прислал ровно столько, сколько нужно показать); урезаем до 8, чтобы
+    // вместе с плитками "Все фото" и "Новые фото" было ровно 10.
+    tagCards = allTagsForSessionCreate.slice(0, 8);
   } else {
     // с поиском — список уже пришёл с backend по полному набору тегов сайта,
     // никакого дополнительного урезания не делаем.
     tagCards = searchResults || [];
   }
 
-  if (!allCardMatches && !tagCards.length) {
+  if (!allCardMatches && !newCardMatches && !tagCards.length) {
     grid.innerHTML = '<div class="tag-card-empty">Ничего не найдено</div>';
     return;
   }
@@ -328,7 +342,18 @@ function renderTagCardGrid(query, searchResults) {
         <div class="tag-card-overlay">Все фото</div>
       </div>`;
   }
-  html += tagCards.map(t => `
+  if (newCardMatches && newPhotosInfo) {
+    html += `
+      <div class="tag-card ${selectedAlbumId === 'new' ? 'selected' : ''}" data-album-id="new" onclick="selectAlbumCard('new')" title="Новые фото — которых нет в опубликованном на главной тир-листе">
+        ${newPhotosInfo.preview_filename
+          ? `<img src="/photos/${newPhotosInfo.preview_filename}" alt="" loading="lazy">`
+          : `<div class="tag-card-noimg">🆕</div>`}
+        <span class="tag-card-ai-badge" style="background:var(--success, #2fb380)">новое</span>
+        <div class="tag-card-overlay">Новые фото <span class="tag-card-count">${newPhotosInfo.count}</span></div>
+      </div>`;
+  }
+
+  const cardHtml = t => `
     <div class="tag-card ${t.id === selectedAlbumId ? 'selected' : ''}" data-album-id="${t.id}" onclick="selectAlbumCard(${t.id})" title="${escapeHtml(t.name)}">
       ${t.preview_filename
         ? `<img src="/photos/${t.preview_filename}" alt="" loading="lazy">`
@@ -336,8 +361,18 @@ function renderTagCardGrid(query, searchResults) {
       ${t.is_favorite ? '<span class="tag-card-fav-badge" title="Один из ваших любимых тегов">⭐</span>' : ''}
       ${!t.has_confirmed ? '<span class="tag-card-ai-badge">только AI</span>' : ''}
       <div class="tag-card-overlay">${escapeHtml(t.name)} <span class="tag-card-count">${t.photo_count}</span></div>
-    </div>
-  `).join('');
+    </div>`;
+
+  // Разбиваем карточки на "Персонажи" и "Общие теги" — заголовок-разделитель
+  // растягивается на всю ширину сетки (grid-column: 1/-1), группа не рендерится,
+  // если в ней нет ни одной карточки.
+  const characterCards = tagCards.filter(t => t.is_character);
+  const generalCards = tagCards.filter(t => !t.is_character);
+  const sectionHtml = (items, label) => items.length
+    ? `<div class="tag-card-section-label">${label}</div>${items.map(cardHtml).join('')}`
+    : '';
+
+  html += sectionHtml(characterCards, '🎭 Персонажи') + sectionHtml(generalCards, '🏷️ Общие теги');
 
   grid.innerHTML = html;
 }
@@ -352,17 +387,18 @@ function selectAlbumCard(albumId) {
 async function submitCreateSession() {
   const title = document.getElementById('new-session-title').value.trim();
   const isAllPhotos = selectedAlbumId === 'all';
+  const isNewPhotos = selectedAlbumId === 'new';
   const includeSuggestions = document.getElementById('include-suggestions-check').checked;
   const shuffle = document.getElementById('shuffle-check').checked;
 
   if (newSessionTiers.length < 2) { toast('Нужно минимум 2 тира', 'err'); return; }
-  if (!isAllPhotos && !selectedAlbumId) { toast('Выберите альбом', 'err'); return; }
+  if (!isAllPhotos && !isNewPhotos && !selectedAlbumId) { toast('Выберите альбом', 'err'); return; }
 
   try {
     const body = {
       title, tiers: newSessionTiers,
-      photo_filter: isAllPhotos ? 'all' : 'tag',
-      tag_id: isAllPhotos ? null : selectedAlbumId,
+      photo_filter: isAllPhotos ? 'all' : isNewPhotos ? 'new' : 'tag',
+      tag_id: (isAllPhotos || isNewPhotos) ? null : selectedAlbumId,
       include_suggestions: includeSuggestions, shuffle
     };
     const resp = await fetch(API + '/api/sessions', {
@@ -527,11 +563,12 @@ function clearPolling() {
 }
 
 function connectWS() {
-  if (!token || !currentSessionId) return;
+  if (!token) return;
   if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}&session_id=${currentSessionId}`);
+  const sessionParam = currentSessionId ? `&session_id=${currentSessionId}` : '';
+  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}${sessionParam}`);
 
   ws.onopen = () => {
     console.log('WS connected');
@@ -540,7 +577,7 @@ function connectWS() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'photo_change' || msg.type === 'voting_closed' || msg.type === 'vote_update') {
+      if (msg.type === 'photo_change' || msg.type === 'vote_update') {
         selectedTierId = null;
         if (msg.type === 'photo_change') pendingNavDirection = msg.direction || 'next';
         loadCurrentPhoto();
@@ -558,6 +595,15 @@ function connectWS() {
         selectedTierId = null;
         loadCurrentPhoto();
         if (currentSessionInfo?.is_owner) toast('Все фото просмотрены!', 'ok');
+      }
+      if (msg.type === 'tags_updated') {
+        // Теги — глобальный атрибут фото, не привязанный к сессии, поэтому
+        // это сообщение приходит по общему (без session_id) каналу и должно
+        // само найти, какой из открытых сейчас экранов его касается —
+        // без ручного обновления страницы кем-либо из подключённых людей.
+        if (msg.photo_id === currentPhotoId) loadTags();
+        if (msg.photo_id === galleryModalPhotoId) loadGalleryModalTags();
+        if (document.getElementById('screen-gallery')?.classList.contains('active')) loadGalleryTags();
       }
     } catch {}
   };
@@ -583,11 +629,6 @@ async function prevPhoto() {
   if (!currentSessionId) return;
   try { await req('POST', `/api/sessions/${currentSessionId}/prev-photo`); selectedTierId=null; pendingNavDirection = 'prev'; loadCurrentPhoto(); }
   catch(e) { toast(e.message||'Уже первая','err'); }
-}
-async function closeVoting() {
-  if (!currentSessionId) return;
-  try { await req('POST', `/api/sessions/${currentSessionId}/close-voting`); toast('Закрыто','ok'); loadCurrentPhoto(); }
-  catch(e) { toast(e.message,'err'); }
 }
 
 async function shufflePhotos() {
@@ -883,6 +924,46 @@ function showTierlist() {
 
 let galleryTagsCache = [];
 let gallerySelectedTagId = null;
+let galleryPage = 1;
+let galleryPageSize = 30;
+let galleryTotalPages = 1;
+let galleryTotal = 0;
+const GALLERY_TARGET_PAGE_SIZE = 30; // ориентир — сколько фото хотим показывать примерно за раз
+
+// Считаем реальное число колонок сетки (CSS сам решает через auto-fill/minmax
+// в зависимости от ширины экрана) и подгоняем page_size так, чтобы он был
+// кратен числу колонок — тогда каждая страница (кроме, возможно, самой
+// последней) заполняет ряды целиком, без "рваного" последнего ряда.
+function measureGalleryColumns() {
+  const grid = document.getElementById('gallery-grid');
+  if (!grid || grid.clientWidth === 0) return null;
+  const cols = getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length;
+  return cols > 0 ? cols : null;
+}
+
+function recomputeGalleryPageSize() {
+  const cols = measureGalleryColumns();
+  if (!cols) return false;
+  const rows = Math.max(1, Math.round(GALLERY_TARGET_PAGE_SIZE / cols));
+  const newSize = cols * rows;
+  if (newSize !== galleryPageSize) {
+    galleryPageSize = newSize;
+    return true;
+  }
+  return false;
+}
+
+let galleryResizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!document.getElementById('screen-gallery')?.classList.contains('active')) return;
+  clearTimeout(galleryResizeTimer);
+  galleryResizeTimer = setTimeout(() => {
+    if (recomputeGalleryPageSize()) {
+      galleryPage = 1;
+      loadGalleryPhotos();
+    }
+  }, 300);
+});
 
 function showGallery() {
   clearPolling();
@@ -890,52 +971,110 @@ function showGallery() {
   showScreen('gallery');
   document.getElementById('gallery-nav-username').textContent = me?.username || '';
   document.getElementById('btn-publish-tierlist').style.display = me?.is_admin ? '' : 'none';
+  document.querySelectorAll('.photo-manager-nav-btn').forEach(b => b.style.display = me?.is_admin ? '' : 'none');
   gallerySelectedTagId = null;
+  galleryPage = 1;
   document.getElementById('gallery-tag-search').value = '';
   document.getElementById('gallery-show-ai-check').checked = false;
+  recomputeGalleryPageSize();
   loadGalleryTags();
   loadGalleryPhotos();
+  connectWS();
 }
 
 function galleryShowAi() {
   return document.getElementById('gallery-show-ai-check').checked;
 }
 
-async function loadGalleryPhotos() {
+async function loadGalleryPhotos(direction) {
   const grid = document.getElementById('gallery-grid');
   const emptyEl = document.getElementById('gallery-empty');
-  grid.innerHTML = '';
-  emptyEl.style.display = 'none';
-  try {
-    const params = new URLSearchParams();
-    if (gallerySelectedTagId) params.set('tag_id', gallerySelectedTagId);
-    if (galleryShowAi()) params.set('include_suggestions', 'true');
-    const photos = await req('GET', `/api/gallery/photos?${params.toString()}`);
-    if (!photos.length) {
-      emptyEl.style.display = '';
-      return;
-    }
-    grid.innerHTML = photos.map(p => `
-      <div class="gallery-photo" onclick="openGalleryPhotoModal(${p.id},'${p.filename}')" title="Нажмите для просмотра">
-        <img src="/photos/${p.filename}" alt="" loading="lazy">
-      </div>`).join('');
-  } catch(e) { toast(e.message, 'err'); }
+
+  const renderInto = async () => {
+    try {
+      const params = new URLSearchParams();
+      if (gallerySelectedTagId) params.set('tag_id', gallerySelectedTagId);
+      if (galleryShowAi()) params.set('include_suggestions', 'true');
+      params.set('page', galleryPage);
+      params.set('page_size', galleryPageSize);
+      const data = await req('GET', `/api/gallery/photos?${params.toString()}`);
+      const photos = data.photos || [];
+      galleryTotal = data.total || 0;
+      galleryTotalPages = data.total_pages || 1;
+      galleryPage = data.page || 1;
+
+      emptyEl.style.display = photos.length ? 'none' : '';
+      grid.innerHTML = photos.map(p => `
+        <div class="gallery-photo" onclick="openGalleryPhotoModal(${p.id},'${p.filename}')" title="Нажмите для просмотра">
+          <img src="/photos/${p.filename}" alt="" loading="lazy">
+        </div>`).join('');
+
+      updateGalleryIssueBar();
+    } catch(e) { toast(e.message, 'err'); }
+  };
+
+  if (!direction) {
+    await renderInto();
+    return;
+  }
+
+  // Переиспользуем тот же язык flip-анимации, что и при перелистывании фото
+  // на голосовании — только теперь "улетает"/"въезжает" вся сетка целиком.
+  const outClass = direction === 'prev' ? 'grid-anim-out-right' : 'grid-anim-out-left';
+  const inClass  = direction === 'prev' ? 'grid-anim-in-left'  : 'grid-anim-in-right';
+  grid.classList.remove('grid-anim-out-left','grid-anim-out-right','grid-anim-in-left','grid-anim-in-right');
+  grid.classList.add(outClass);
+  await new Promise(r => setTimeout(r, 160));
+  await renderInto();
+  grid.classList.remove(outClass);
+  grid.classList.add(inClass);
+  setTimeout(() => grid.classList.remove(inClass), 300);
+}
+
+function updateGalleryIssueBar() {
+  document.getElementById('gallery-issue-num').textContent = galleryPage;
+  document.getElementById('gallery-issue-total').textContent = galleryTotalPages;
+  const shown = galleryTotal === 0 ? 0 : Math.min(galleryPageSize, galleryTotal - (galleryPage - 1) * galleryPageSize);
+  document.getElementById('gallery-issue-sub').textContent = `показано ${shown} из ${galleryTotal}`;
+  document.getElementById('gallery-prev-btn').disabled = galleryPage <= 1;
+  document.getElementById('gallery-next-btn').disabled = galleryPage >= galleryTotalPages;
+  document.querySelector('.gallery-issue-bar').style.display = galleryTotalPages > 1 ? '' : 'none';
+}
+
+function galleryGoPage(page) {
+  if (page < 1 || page > galleryTotalPages || page === galleryPage) return;
+  const direction = page > galleryPage ? 'next' : 'prev';
+  galleryPage = page;
+  loadGalleryPhotos(direction);
+  document.querySelector('.gallery-photos-col')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function galleryRandomPage() {
+  if (galleryTotalPages <= 1) return;
+  let page;
+  do { page = 1 + Math.floor(Math.random() * galleryTotalPages); } while (page === galleryPage && galleryTotalPages > 1);
+  galleryPage = page;
+  loadGalleryPhotos(Math.random() > 0.5 ? 'next' : 'prev');
 }
 
 async function openGalleryPhotoModal(photoId, filename) {
   // Лёгкая версия модалки без оценок — галерея вне сессий принципиально
-  // не показывает кто и как оценил (это привязано к конкретной сессии).
+  // не показывает кто и как оценил (это привязано к конкретной сессии),
+  // поэтому блок с оценками просто скрываем целиком, а не поясняем текстом.
   // Теги при этом глобальны для фото, поэтому их показываем, включая
   // возможность подтвердить AI-предложение — но без добавления своих тегов.
   galleryModalPhotoId = photoId;
   const modal = document.getElementById('photo-modal');
   const img = document.getElementById('modal-img');
   const fname = document.getElementById('modal-filename');
+  const votesTitle = document.getElementById('modal-votes-title');
   const votesEl = document.getElementById('modal-votes');
   const tagsEl = document.getElementById('modal-tags');
   img.src = `/photos/${filename}`;
   fname.textContent = '';
-  votesEl.innerHTML = '<div class="modal-loading">Оценки участников доступны только внутри сессии</div>';
+  votesTitle.style.display = 'none';
+  votesEl.style.display = 'none';
+  votesEl.innerHTML = '';
   tagsEl.innerHTML = '<div class="modal-loading">Загрузка тегов...</div>';
   modal.style.display = 'flex';
   document.body.style.overflow = 'hidden';
@@ -947,25 +1086,33 @@ async function loadGalleryModalTags() {
   const tagsEl = document.getElementById('modal-tags');
   try {
     const data = await req('GET', `/api/photo-tags/${galleryModalPhotoId}`);
-    const confirmed = {};
-    (data.all || []).filter(r => !r.is_suggestion).forEach(r => {
-      if (!confirmed[r.tag_name]) confirmed[r.tag_name] = [];
-      confirmed[r.tag_name].push(r.username);
-    });
-    const confirmedHtml = Object.entries(confirmed).map(([name, users]) => `
-      <span class="tag-chip other" style="cursor:default" title="${users.join(', ')}: ${name}">
-        ${name} <span class="tag-users">${users.length}</span>
-      </span>`).join('');
+    const all = data.all || [];
+    const groupHtml = (isCharacter, label) => {
+      const confirmed = {};
+      all.filter(r => !r.is_suggestion && !!r.is_character === isCharacter).forEach(r => {
+        if (!confirmed[r.tag_name]) confirmed[r.tag_name] = [];
+        confirmed[r.tag_name].push(r.username);
+      });
+      const confirmedHtml = Object.entries(confirmed).map(([name, users]) => `
+        <span class="tag-chip other" style="cursor:default" title="${users.join(', ')}: ${name}">
+          ${name} <span class="tag-users">${users.length}</span>
+        </span>`).join('');
 
-    const suggestions = (data.all || []).filter(r => r.is_suggestion);
-    const suggestionsHtml = suggestions.map(r => `
-      <span class="tag-chip suggestion" title="Предложено автотегированием — подтвердите или отклоните">
-        <span class="ai-badge">AI</span> ${r.tag_name}
-        <span class="tag-confirm" onclick="confirmGalleryTag(${r.tag_id})" title="Подтвердить">✓</span>
-        <span class="tag-reject" onclick="rejectGalleryTag(${r.tag_id})" title="Отклонить">✕</span>
-      </span>`).join('');
+      const suggestions = all.filter(r => r.is_suggestion && !!r.is_character === isCharacter);
+      const suggestionsHtml = suggestions.map(r => `
+        <span class="tag-chip suggestion" title="Предложено автотегированием — подтвердите или отклоните">
+          <span class="ai-badge">AI</span> ${r.tag_name}
+          <span class="tag-confirm" onclick="confirmGalleryTag(${r.tag_id})" title="Подтвердить">✓</span>
+          <span class="tag-reject" onclick="rejectGalleryTag(${r.tag_id})" title="Отклонить">✕</span>
+        </span>`).join('');
 
-    tagsEl.innerHTML = (confirmedHtml + suggestionsHtml) || '<div class="modal-empty">Нет тегов</div>';
+      const combined = confirmedHtml + suggestionsHtml;
+      if (!combined) return '';
+      return `<div class="tag-group"><div class="tag-group-label">${label}</div><div class="tag-group-chips">${combined}</div></div>`;
+    };
+
+    const html = groupHtml(true, '🎭 Персонажи') + groupHtml(false, '🏷️ Общие теги');
+    tagsEl.innerHTML = html || '<div class="modal-empty">Нет тегов</div>';
   } catch(e) {
     tagsEl.innerHTML = '<div class="modal-empty">Ошибка загрузки тегов</div>';
   }
@@ -989,6 +1136,7 @@ async function rejectGalleryTag(tagId) {
 
 async function loadGalleryTags() {
   const list = document.getElementById('gallery-tag-list');
+  galleryPage = 1;
   try {
     galleryTagsCache = await req('GET', `/api/gallery/tags?include_suggestions=${galleryShowAi()}`);
     renderGalleryTagPanel('');
@@ -1017,20 +1165,30 @@ function renderGalleryTagPanel(query) {
     ? galleryTagsCache.find(t => t.id === gallerySelectedTagId)?.name || ''
     : 'Выберите тег';
 
-  list.innerHTML = visible.map(t => `
+  const chipHtml = t => `
     <button class="tl-tag-chip ${t.id === gallerySelectedTagId ? 'active' : ''}"
-      onclick="selectGalleryTag(${t.id})">${!t.has_confirmed ? '🤖 ' : ''}${escapeHtml(t.name)} <span style="opacity:.7">${t.photo_count}</span></button>
-  `).join('') || '<span class="tl-tags-loading">Ничего не найдено</span>';
+      onclick="selectGalleryTag(${t.id})">${!t.has_confirmed ? '🤖 ' : ''}${escapeHtml(t.name)} <span style="opacity:.7">${t.photo_count}</span></button>`;
+
+  const characters = visible.filter(t => t.is_character);
+  const general = visible.filter(t => !t.is_character);
+  const groupHtml = (items, label) => items.length
+    ? `<div class="tag-group-label tl-tag-group-label">${label}</div>${items.map(chipHtml).join('')}`
+    : '';
+
+  list.innerHTML = (groupHtml(characters, '🎭 Персонажи') + groupHtml(general, '🏷️ Общие теги'))
+    || '<span class="tl-tags-loading">Ничего не найдено</span>';
 }
 
 function selectGalleryTag(tagId) {
   gallerySelectedTagId = gallerySelectedTagId === tagId ? null : tagId;
+  galleryPage = 1;
   renderGalleryTagPanel(document.getElementById('gallery-tag-search').value);
   loadGalleryPhotos();
 }
 
 function clearGalleryTagFilter() {
   gallerySelectedTagId = null;
+  galleryPage = 1;
   document.getElementById('gallery-tag-search').value = '';
   renderGalleryTagPanel('');
   loadGalleryPhotos();
@@ -1460,11 +1618,14 @@ async function openPhotoModal(photoId, filename) {
   const modal = document.getElementById('photo-modal');
   const img = document.getElementById('modal-img');
   const fname = document.getElementById('modal-filename');
+  const votesTitle = document.getElementById('modal-votes-title');
   const votesEl = document.getElementById('modal-votes');
   const tagsEl = document.getElementById('modal-tags');
 
   img.src = `/photos/${filename}`;
   fname.textContent = '';
+  votesTitle.style.display = '';
+  votesEl.style.display = '';
   votesEl.innerHTML = '<div class="modal-loading">Загрузка...</div>';
   tagsEl.innerHTML = '';
   modal.style.display = 'flex';
@@ -1536,17 +1697,25 @@ async function loadTags() {
 function renderTags() {
   const sel = document.getElementById('tags-selected');
   if (!sel) return;
+  sel.innerHTML = buildTagGroupHtml(true, '🎭 Персонажи') + buildTagGroupHtml(false, '🏷️ Общие теги');
+}
 
-  // мои подтверждённые теги — съёмные чипы
-  const myHtml = myTags.map(t => `
+// Строит HTML одной группы тегов (персонаж/общие) для экрана голосования —
+// внутри группы сохраняется прежнее деление на "мои" (съёмные), "чужие"
+// подтверждённые (кликабельные, чтобы присоединиться) и AI-предложения
+// (с подтверждением/отклонением). Группа, в которой вообще нет тегов,
+// не рендерится — если у фото нет ни одного тега-персонажа, заголовок
+// "Персонажи" просто не появится.
+function buildTagGroupHtml(isCharacter, label) {
+  const myFiltered = myTags.filter(t => !!t.is_character === isCharacter);
+  const myHtml = myFiltered.map(t => `
     <span class="tag-chip mine" title="Нажмите чтобы удалить">
       ${t.name}
       <span class="tag-remove" onclick="removeTag(${t.id})">×</span>
     </span>`).join('');
 
-  // подтверждённые теги других пользователей, сгруппированные по имени
   const myTagNames = new Set(myTags.map(t => t.name));
-  const confirmed = allPhotoTags.filter(r => !r.is_suggestion);
+  const confirmed = allPhotoTags.filter(r => !r.is_suggestion && !!r.is_character === isCharacter);
   const others = {};
   confirmed.forEach(r => {
     if (!others[r.tag_name]) others[r.tag_name] = [];
@@ -1560,10 +1729,7 @@ function renderTags() {
         ${name} <span class="tag-users">${users.length}</span>
       </span>`).join('');
 
-  // предложения от автотегирования — отдельная группа с кнопками подтвердить/отклонить.
-  // Если тег уже подтверждён (есть среди myTags/others), повторно как suggestion не показываем —
-  // это та же самая запись в БД, просто её is_suggestion уже снят.
-  const suggestions = allPhotoTags.filter(r => r.is_suggestion);
+  const suggestions = allPhotoTags.filter(r => r.is_suggestion && !!r.is_character === isCharacter);
   const suggestionsHtml = suggestions.map(r => `
       <span class="tag-chip suggestion" title="Предложено автотегированием — подтвердите или отклоните">
         <span class="ai-badge">AI</span> ${r.tag_name}
@@ -1571,7 +1737,9 @@ function renderTags() {
         <span class="tag-reject" onclick="rejectSuggestedTag(${r.tag_id})" title="Отклонить">✕</span>
       </span>`).join('');
 
-  sel.innerHTML = myHtml + othersHtml + suggestionsHtml;
+  const combined = myHtml + othersHtml + suggestionsHtml;
+  if (!combined) return '';
+  return `<div class="tag-group"><div class="tag-group-label">${label}</div><div class="tag-group-chips">${combined}</div></div>`;
 }
 
 async function confirmSuggestedTag(tagId) {
@@ -1741,6 +1909,50 @@ async function mergeDuplicatePhotos() {
     const d = await req('POST', '/api/admin/duplicate-photos/merge');
     toast(`Объединено групп: ${d.merged_groups}, удалено лишних копий: ${d.removed_photos}`, 'ok');
     checkDuplicatePhotos();
+    loadPhotos();
+    loadAdminStats();
+  } catch(e) {
+    toast(e.message || 'Ошибка', 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Объединить дубли';
+  }
+}
+
+// Проверка дублей ПО СОДЕРЖИМОМУ картинки (перцептивный хеш) — в отличие от
+// проверки по имени файла выше, запускается только вручную по кнопке:
+// на первом прогоне может потребоваться время на вычисление хеша каждого
+// фото (дальше значения кэшируются в БД, повторный прогон быстрый).
+async function checkDuplicatePhotosByImage() {
+  const statusEl = document.getElementById('duplicate-image-status');
+  const mergeBtn = document.getElementById('merge-duplicates-image-btn');
+  const btn = document.querySelector('button[onclick="checkDuplicatePhotosByImage()"]');
+  if (!statusEl) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Сканирую...'; }
+  statusEl.innerHTML = '<span class="hint">Считаю хеши фото, это может занять время при первом запуске...</span>';
+  try {
+    const d = await req('POST', '/api/admin/duplicate-photos/scan-by-image');
+    if (d.groups === 0) {
+      statusEl.innerHTML = `<span class="watch-on">⬤ Дублей не найдено</span> (просканировано новых фото: ${d.scanned})`;
+      mergeBtn.style.display = 'none';
+    } else {
+      statusEl.innerHTML = `<span class="watch-off">⬤ Найдено ${d.groups} групп дублей, лишних фото: ${d.extra_photos}</span> (просканировано новых фото: ${d.scanned})`;
+      mergeBtn.style.display = '';
+    }
+  } catch(e) {
+    statusEl.textContent = e.message || 'Ошибка сканирования';
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Проверить по картинке'; }
+  }
+}
+
+async function mergeDuplicatePhotosByImage() {
+  if (!confirm('Объединить дубли по содержимому картинки? Лишние копии будут удалены, а их голоса и теги перенесены на оставшуюся копию. Действие необратимо.')) return;
+  const btn = document.getElementById('merge-duplicates-image-btn');
+  btn.disabled = true; btn.textContent = 'Объединяю...';
+  try {
+    const d = await req('POST', '/api/admin/duplicate-photos/merge-by-image');
+    toast(`Объединено групп: ${d.merged_groups}, удалено лишних копий: ${d.removed_photos}`, 'ok');
+    checkDuplicatePhotosByImage();
     loadPhotos();
     loadAdminStats();
   } catch(e) {

@@ -270,6 +270,12 @@ def init_db():
     gdrive_watch_cols = [r[1] for r in db.execute("PRAGMA table_info(gdrive_watch)").fetchall()]
     if 'last_sync_error_msg' not in gdrive_watch_cols:
         db.execute("ALTER TABLE gdrive_watch ADD COLUMN last_sync_error_msg TEXT")
+    photos_cols = [r[1] for r in db.execute("PRAGMA table_info(photos)").fetchall()]
+    if 'phash' not in photos_cols:
+        # перцептивный хеш файла (dHash, 64 бита в hex) — для поиска дублей
+        # по содержимому картинки, а не по имени файла. Считается лениво по
+        # кнопке в "Управление фото", не на каждой загрузке — см. scan_photo_hashes.
+        db.execute("ALTER TABLE photos ADD COLUMN phash TEXT")
     # Системный пользователь, от имени которого пишутся автотеги WD14.
     # is_system=1 — исключается из всех счётчиков "обычных" людей
     # (прогресс-бар голосования, список участников статистики и т.п.).
@@ -575,6 +581,23 @@ def list_sessions(user=Depends(current_user)):
     db.close()
     return [dict(r) for r in rows]
 
+def get_published_photo_ids(db) -> set:
+    """
+    Множество id фото, которые входят в ТЕКУЩИЙ опубликованный на главной
+    странице снимок тир-листа (если ничего не опубликовано — пустое
+    множество). Используется для альбома "Новые фото" при создании сессии —
+    чтобы выбрать фото, которых ещё нет в опубликованном тир-листе.
+    """
+    row = db.execute("SELECT snapshot_json FROM published_tierlist WHERE id=1").fetchone()
+    if not row:
+        return set()
+    snapshot = json.loads(row["snapshot_json"])
+    ids = set()
+    for tier_photos in snapshot.get("tiers", {}).values():
+        for p in tier_photos:
+            ids.add(p["id"])
+    return ids
+
 @app.post("/api/sessions")
 def create_session(body: dict, user=Depends(current_user)):
     """
@@ -582,7 +605,9 @@ def create_session(body: dict, user=Depends(current_user)):
     body:
       title: str — название сессии
       tiers: list — тиры (как в /api/sessions/{id}/tiers), минимум 2
-      photo_filter: "all" | "tag" — какая подборка фото войдёт в сессию
+      photo_filter: "all" | "tag" | "new" — какая подборка фото войдёт в сессию
+                    ("new" — фото, которых ещё нет в опубликованном на главной
+                    тир-листе)
       tag_id: int (если photo_filter == "tag") — id тега для фильтра
       include_suggestions: bool — включать ли фото, у которых тег есть
                             только как неподтверждённое предложение AI
@@ -619,6 +644,10 @@ def create_session(body: dict, user=Depends(current_user)):
                 "SELECT DISTINCT photo_id FROM photo_tags WHERE tag_id=? AND is_suggestion=0", (tag_id,)
             ).fetchall()
         photo_ids = [r["photo_id"] for r in rows]
+    elif photo_filter == "new":
+        published_ids = get_published_photo_ids(db)
+        rows = db.execute("SELECT id FROM photos ORDER BY position").fetchall()
+        photo_ids = [r["id"] for r in rows if r["id"] not in published_ids]
     else:
         rows = db.execute("SELECT id FROM photos ORDER BY position").fetchall()
         photo_ids = [r["id"] for r in rows]
@@ -706,29 +735,49 @@ def end_session(session_id: int, user=Depends(current_user)):
 # сайт-админ явно публикует на главную (см. ниже).
 
 @app.get("/api/gallery/photos")
-def gallery_photos(tag_id: Optional[int] = None, include_suggestions: bool = False, user=Depends(current_user)):
+def gallery_photos(tag_id: Optional[int] = None, include_suggestions: bool = False,
+                    page: int = 1, page_size: int = 30, user=Depends(current_user)):
     """
-    Список фото для галереи. tag_id — необязательный фильтр (показывать
-    только фото с этим тегом). include_suggestions согласуется с тем же
-    переключателем, что в /api/gallery/tags — если включён, фильтр по тегу
-    учитывает и неподтверждённые AI-предложения (иначе выбор AI-тега в
-    фильтре вернул бы пустой список, хотя сам тег показывается).
+    Список фото для галереи, постранично ("выпусками") — чтобы не листать
+    тысячи фото одной бесконечной лентой. tag_id — необязательный фильтр
+    (показывать только фото с этим тегом). include_suggestions согласуется
+    с тем же переключателем, что в /api/gallery/tags — если включён, фильтр
+    по тегу учитывает и неподтверждённые AI-предложения (иначе выбор AI-тега
+    в фильтре вернул бы пустой список, хотя сам тег показывается).
     """
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
+    offset = (page - 1) * page_size
     db = get_db()
     if tag_id:
         suggestion_clause = "" if include_suggestions else "AND pt.is_suggestion = 0"
+        total = db.execute(f"""
+            SELECT COUNT(DISTINCT p.id) as c
+            FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id
+            WHERE pt.tag_id = ? {suggestion_clause}
+        """, (tag_id,)).fetchone()["c"]
         rows = db.execute(f"""
-            SELECT DISTINCT p.id, p.filename, p.original_name
+            SELECT DISTINCT p.id, p.filename, p.original_name, p.position
             FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id
             WHERE pt.tag_id = ? {suggestion_clause}
             ORDER BY p.position
-        """, (tag_id,)).fetchall()
+            LIMIT ? OFFSET ?
+        """, (tag_id, page_size, offset)).fetchall()
     else:
+        total = db.execute("SELECT COUNT(*) as c FROM photos").fetchone()["c"]
         rows = db.execute(
-            "SELECT id, filename, original_name FROM photos ORDER BY position"
+            "SELECT id, filename, original_name FROM photos ORDER BY position LIMIT ? OFFSET ?",
+            (page_size, offset)
         ).fetchall()
     db.close()
-    return [dict(r) for r in rows]
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    return {
+        "photos": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
 
 @app.get("/api/gallery/tags")
 def gallery_tags(include_suggestions: bool = False, user=Depends(current_user)):
@@ -747,7 +796,7 @@ def gallery_tags(include_suggestions: bool = False, user=Depends(current_user)):
     db = get_db()
     suggestion_clause = "" if include_suggestions else "AND pt.is_suggestion = 0"
     rows = db.execute(f"""
-        SELECT t.id, t.name, COUNT(DISTINCT pt.photo_id) as photo_count,
+        SELECT t.id, t.name, t.category, COUNT(DISTINCT pt.photo_id) as photo_count,
                MAX(CASE WHEN pt.is_suggestion = 0 THEN 1 ELSE 0 END) as has_confirmed
         FROM tags t JOIN photo_tags pt ON pt.tag_id = t.id
         WHERE 1=1 {suggestion_clause}
@@ -757,7 +806,7 @@ def gallery_tags(include_suggestions: bool = False, user=Depends(current_user)):
     """).fetchall()
     db.close()
     return [{"id": r["id"], "name": r["name"], "photo_count": r["photo_count"],
-             "has_confirmed": bool(r["has_confirmed"])} for r in rows]
+             "has_confirmed": bool(r["has_confirmed"]), "is_character": r["category"] == 4} for r in rows]
 
 @app.get("/api/gallery/published-tierlist")
 def get_published_tierlist(user=Depends(current_user)):
@@ -1019,7 +1068,7 @@ async def gdrive_download_file(file_id: str) -> bytes:
 
 
 @app.post("/api/admin/import-yadisk")
-async def import_yadisk(public_url: str = Form(...), user=Depends(current_user)):
+async def import_yadisk(public_url: str = Form(...), user=Depends(admin_user)):
     """
     Сканирует публичную папку Яндекс.Диска и импортирует все изображения.
     Уже существующие файлы (по имени) пропускаются.
@@ -1080,7 +1129,7 @@ async def import_yadisk(public_url: str = Form(...), user=Depends(current_user))
 
 
 @app.get("/api/admin/preview-yadisk")
-async def preview_yadisk(public_url: str, user=Depends(current_user)):
+async def preview_yadisk(public_url: str, user=Depends(admin_user)):
     """Возвращает список файлов в папке без скачивания."""
     try:
         files = await yadisk_list_files(public_url)
@@ -1199,7 +1248,7 @@ async def yadisk_sync_loop():
 
 
 @app.get("/api/admin/yadisk-watch")
-def get_yadisk_watch(user=Depends(current_user)):
+def get_yadisk_watch(user=Depends(admin_user)):
     db = get_db()
     row = db.execute("SELECT * FROM yadisk_watch WHERE id=1").fetchone()
     db.close()
@@ -1210,7 +1259,7 @@ def get_yadisk_watch(user=Depends(current_user)):
 async def set_yadisk_watch(
     public_url: str = Form(...),
     interval_minutes: int = Form(60),
-    user=Depends(current_user)
+    user=Depends(admin_user)
 ):
     db = get_db()
     db.execute(
@@ -1226,7 +1275,7 @@ async def set_yadisk_watch(
 
 
 @app.delete("/api/admin/yadisk-watch")
-def delete_yadisk_watch(user=Depends(current_user)):
+def delete_yadisk_watch(user=Depends(admin_user)):
     db = get_db()
     db.execute("DELETE FROM yadisk_watch WHERE id=1")
     db.commit(); db.close()
@@ -1234,7 +1283,7 @@ def delete_yadisk_watch(user=Depends(current_user)):
 
 
 @app.post("/api/admin/yadisk-watch/sync-now")
-async def yadisk_watch_sync_now(user=Depends(current_user)):
+async def yadisk_watch_sync_now(user=Depends(admin_user)):
     result = await yadisk_sync_once()
     return result
 
@@ -1245,7 +1294,7 @@ async def yadisk_watch_sync_now(user=Depends(current_user)):
 # плоский список — без сохранения структуры, как и договаривались.
 
 @app.post("/api/admin/import-gdrive")
-async def import_gdrive(folder_url: str = Form(...), user=Depends(current_user)):
+async def import_gdrive(folder_url: str = Form(...), user=Depends(admin_user)):
     """
     Сканирует публичную папку Google Drive (включая подпапки) и импортирует
     все изображения. Уже существующие файлы (по имени) пропускаются.
@@ -1305,7 +1354,7 @@ async def import_gdrive(folder_url: str = Form(...), user=Depends(current_user))
 
 
 @app.get("/api/admin/preview-gdrive")
-async def preview_gdrive(folder_url: str, user=Depends(current_user)):
+async def preview_gdrive(folder_url: str, user=Depends(admin_user)):
     """Возвращает список файлов в папке без скачивания."""
     try:
         files = await gdrive_list_files(folder_url)
@@ -1425,7 +1474,7 @@ async def gdrive_sync_loop():
 
 
 @app.get("/api/admin/gdrive-watch")
-def get_gdrive_watch(user=Depends(current_user)):
+def get_gdrive_watch(user=Depends(admin_user)):
     db = get_db()
     row = db.execute("SELECT * FROM gdrive_watch WHERE id=1").fetchone()
     db.close()
@@ -1436,7 +1485,7 @@ def get_gdrive_watch(user=Depends(current_user)):
 async def set_gdrive_watch(
     folder_url: str = Form(...),
     interval_minutes: int = Form(60),
-    user=Depends(current_user)
+    user=Depends(admin_user)
 ):
     db = get_db()
     db.execute(
@@ -1452,7 +1501,7 @@ async def set_gdrive_watch(
 
 
 @app.delete("/api/admin/gdrive-watch")
-def delete_gdrive_watch(user=Depends(current_user)):
+def delete_gdrive_watch(user=Depends(admin_user)):
     db = get_db()
     db.execute("DELETE FROM gdrive_watch WHERE id=1")
     db.commit(); db.close()
@@ -1460,7 +1509,7 @@ def delete_gdrive_watch(user=Depends(current_user)):
 
 
 @app.post("/api/admin/gdrive-watch/sync-now")
-async def gdrive_watch_sync_now(user=Depends(current_user)):
+async def gdrive_watch_sync_now(user=Depends(admin_user)):
     result = await gdrive_sync_once()
     return result
 
@@ -1468,7 +1517,7 @@ async def gdrive_watch_sync_now(user=Depends(current_user)):
 # ── PHOTOS ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/admin/photos/upload")
-async def upload_photos(files: list[UploadFile] = File(...), user=Depends(current_user)):
+async def upload_photos(files: list[UploadFile] = File(...), user=Depends(admin_user)):
     db = get_db(); added = 0
     new_photos = []  # (photo_id, full_path) — для автотегирования после вставки
     for f in files:
@@ -1494,7 +1543,7 @@ async def upload_photos(files: list[UploadFile] = File(...), user=Depends(curren
     return {"added": added}
 
 @app.get("/api/admin/photos")
-def admin_photos(user=Depends(current_user)):
+def admin_photos(user=Depends(admin_user)):
     db = get_db()
     rows = db.execute("""
         SELECT p.*, COUNT(r.id) as vote_count
@@ -1504,7 +1553,7 @@ def admin_photos(user=Depends(current_user)):
     db.close(); return [dict(r) for r in rows]
 
 @app.delete("/api/admin/photos/{pid}")
-def delete_photo(pid: int, user=Depends(current_user)):
+def delete_photo(pid: int, user=Depends(admin_user)):
     db = get_db()
     row = db.execute("SELECT filename FROM photos WHERE id=?", (pid,)).fetchone()
     if row:
@@ -1516,60 +1565,75 @@ def delete_photo(pid: int, user=Depends(current_user)):
         db.commit()
     db.close(); return {"ok": True}
 
-@app.get("/api/admin/duplicate-photos")
-def find_duplicate_photos(user=Depends(current_user)):
+def compute_dhash(path: str, hash_size: int = 8):
     """
-    Находит фото с одинаковым original_name — обычно следствие гонки при
-    параллельном запуске синхронизации (см. merge_duplicate_photos). Не
-    удаляет ничего сама, только показывает, что будет затронуто.
+    Перцептивный хеш изображения (difference hash) — в отличие от простого
+    хеша файла (md5/sha), устойчив к пересохранению в другом качестве/формате:
+    два визуально одинаковых фото дадут одинаковый (или очень близкий) хеш,
+    даже если байты файлов разные. Возвращает 16-символьную hex-строку
+    (64 бита) или None, если файл не удалось прочитать как изображение.
     """
-    db = get_db()
-    groups = db.execute("""
-        SELECT original_name, GROUP_CONCAT(id) as ids, COUNT(*) as cnt
-        FROM photos GROUP BY original_name HAVING cnt > 1
-        ORDER BY cnt DESC
-    """).fetchall()
-    db.close()
-    return {
-        "groups": len(groups),
-        "extra_photos": sum(g["cnt"] - 1 for g in groups),
-        "details": [{"original_name": g["original_name"], "ids": g["ids"], "count": g["cnt"]} for g in groups],
-    }
+    try:
+        from PIL import Image
+        img = Image.open(path).convert("L").resize((hash_size + 1, hash_size), Image.LANCZOS)
+        pixels = list(img.getdata())
+        bits = 0
+        w = hash_size + 1
+        for row in range(hash_size):
+            for col in range(hash_size):
+                left = pixels[row * w + col]
+                right = pixels[row * w + col + 1]
+                bits = (bits << 1) | (1 if left > right else 0)
+        return format(bits, "016x")
+    except Exception:
+        return None
 
-@app.post("/api/admin/duplicate-photos/merge")
-def merge_duplicate_photos(user=Depends(current_user)):
+def ensure_photo_hashes(db) -> int:
     """
-    Объединяет дубли (фото с одинаковым original_name, обычно из-за гонки
-    при параллельном запуске авто-синхронизации до того, как в коде
-    появилась защита через Lock). Для каждой группы дублей оставляет самую
-    раннюю запись (минимальный id), а голоса и теги с удаляемых копий
-    переносит на неё — не теряет, если разные люди успели проголосовать
-    на разных копиях одного и того же фото. Файлы лишних копий удаляются с диска.
+    Считает phash для всех фото, у которых он ещё не посчитан (NULL).
+    Возвращает число реально обработанных файлов. Вызывается только по
+    явному нажатию кнопки в "Управление фото" — не автоматически при
+    каждой загрузке фото, чтобы не тормозить обычную загрузку/импорт.
     """
-    db = get_db()
-    groups = db.execute("""
-        SELECT original_name, GROUP_CONCAT(id) as ids
-        FROM photos GROUP BY original_name HAVING COUNT(*) > 1
-    """).fetchall()
+    rows = db.execute("SELECT id, filename FROM photos WHERE phash IS NULL").fetchall()
+    computed = 0
+    for r in rows:
+        h = compute_dhash(os.path.join(PHOTOS_DIR, r["filename"]))
+        if h:
+            db.execute("UPDATE photos SET phash=? WHERE id=?", (h, r["id"]))
+            computed += 1
+        else:
+            # не удалось прочитать как изображение — ставим заведомо
+            # неповторимый маркер, чтобы не пересчитывать его снова и снова
+            # и чтобы он точно не попал ни в одну группу дублей
+            db.execute("UPDATE photos SET phash=? WHERE id=?", (f"ERR:{r['id']}", r["id"]))
+    db.commit()
+    return computed
 
+def merge_photo_groups(db, id_groups: list):
+    """
+    Общая логика объединения дублей: принимает список групп id фото
+    (в каждой группе оставляет самую раннюю запись — минимальный id — и
+    переносит на неё голоса/теги/присутствие в сессиях с удаляемых копий,
+    не теряя чужие оценки, если разные люди успели проголосовать на разных
+    копиях одного и того же фото). Используется и для дублей по имени файла,
+    и для дублей по содержимому картинки — сам механизм слияния одинаков,
+    отличается только то, как эти группы были найдены.
+    """
     merged_groups = 0
     removed_photos = 0
-    for g in groups:
-        ids = sorted(int(x) for x in g["ids"].split(","))
+    for ids in id_groups:
+        ids = sorted(ids)
         keep_id = ids[0]
         remove_ids = ids[1:]
 
         for rid in remove_ids:
-            # переносим голоса и теги, которых ещё нет у keep_id (не теряем чужие оценки).
-            # Голоса переносим по сессиям отдельно — UNIQUE теперь (session_id, photo_id, user_id).
             for r in db.execute("SELECT session_id, user_id, tier_id FROM ratings WHERE photo_id=?", (rid,)).fetchall():
                 db.execute("INSERT OR IGNORE INTO ratings (session_id, photo_id, user_id, tier_id) VALUES (?,?,?,?)",
                            (r["session_id"], keep_id, r["user_id"], r["tier_id"]))
             for t in db.execute("SELECT user_id, tag_id, is_suggestion FROM photo_tags WHERE photo_id=?", (rid,)).fetchall():
                 db.execute("INSERT OR IGNORE INTO photo_tags (photo_id, user_id, tag_id, is_suggestion) VALUES (?,?,?,?)",
                            (keep_id, t["user_id"], t["tag_id"], t["is_suggestion"]))
-            # session_photos: если оба фото (keep и rid) оказались в одной и той же
-            # сессии — оставляем позицию keep, иначе переносим запись с rid на keep.
             for sp in db.execute("SELECT session_id FROM session_photos WHERE photo_id=?", (rid,)).fetchall():
                 db.execute("INSERT OR IGNORE INTO session_photos (session_id, photo_id, position) "
                            "SELECT session_id, ?, position FROM session_photos WHERE session_id=? AND photo_id=?",
@@ -1589,6 +1653,89 @@ def merge_duplicate_photos(user=Depends(current_user)):
         merged_groups += 1
 
     db.commit()
+    return merged_groups, removed_photos
+
+@app.get("/api/admin/duplicate-photos")
+def find_duplicate_photos(user=Depends(admin_user)):
+    """
+    Находит фото с одинаковым original_name — обычно следствие гонки при
+    параллельном запуске синхронизации (см. merge_duplicate_photos). Не
+    удаляет ничего сама, только показывает, что будет затронуто.
+    """
+    db = get_db()
+    groups = db.execute("""
+        SELECT original_name, GROUP_CONCAT(id) as ids, COUNT(*) as cnt
+        FROM photos GROUP BY original_name HAVING cnt > 1
+        ORDER BY cnt DESC
+    """).fetchall()
+    db.close()
+    return {
+        "groups": len(groups),
+        "extra_photos": sum(g["cnt"] - 1 for g in groups),
+        "details": [{"original_name": g["original_name"], "ids": g["ids"], "count": g["cnt"]} for g in groups],
+    }
+
+@app.post("/api/admin/duplicate-photos/merge")
+def merge_duplicate_photos(user=Depends(admin_user)):
+    """
+    Объединяет дубли (фото с одинаковым original_name, обычно из-за гонки
+    при параллельном запуске авто-синхронизации до того, как в коде
+    появилась защита через Lock). Для каждой группы дублей оставляет самую
+    раннюю запись (минимальный id), а голоса и теги с удаляемых копий
+    переносит на неё — не теряет, если разные люди успели проголосовать
+    на разных копиях одного и того же фото. Файлы лишних копий удаляются с диска.
+    """
+    db = get_db()
+    groups = db.execute("""
+        SELECT GROUP_CONCAT(id) as ids
+        FROM photos GROUP BY original_name HAVING COUNT(*) > 1
+    """).fetchall()
+    id_groups = [[int(x) for x in g["ids"].split(",")] for g in groups]
+    merged_groups, removed_photos = merge_photo_groups(db, id_groups)
+    db.close()
+    return {"merged_groups": merged_groups, "removed_photos": removed_photos}
+
+@app.post("/api/admin/duplicate-photos/scan-by-image")
+def scan_duplicate_photos_by_image(user=Depends(admin_user)):
+    """
+    Поиск дублей ПО СОДЕРЖИМОМУ картинки (перцептивный хеш), а не по имени
+    файла — находит одно и то же изображение, загруженное под разными
+    именами. Запускается только по нажатию кнопки в "Управление фото"
+    (не автоматически при каждом открытии экрана, в отличие от проверки
+    по имени файла) — вычисление хешей может занять время на первом прогоне
+    для большого количества фото, дальше значения кэшируются в БД.
+    """
+    db = get_db()
+    scanned = ensure_photo_hashes(db)
+    groups = db.execute("""
+        SELECT phash, GROUP_CONCAT(id) as ids, GROUP_CONCAT(filename) as filenames, COUNT(*) as cnt
+        FROM photos
+        WHERE phash IS NOT NULL AND phash NOT LIKE 'ERR:%'
+        GROUP BY phash HAVING cnt > 1
+        ORDER BY cnt DESC
+    """).fetchall()
+    db.close()
+    return {
+        "scanned": scanned,
+        "groups": len(groups),
+        "extra_photos": sum(g["cnt"] - 1 for g in groups),
+        "details": [{"ids": g["ids"], "count": g["cnt"],
+                     "preview_filename": g["filenames"].split(",")[0]} for g in groups],
+    }
+
+@app.post("/api/admin/duplicate-photos/merge-by-image")
+def merge_duplicate_photos_by_image(user=Depends(admin_user)):
+    """Объединяет дубли, найденные scan_duplicate_photos_by_image (по содержимому картинки)."""
+    db = get_db()
+    ensure_photo_hashes(db)
+    groups = db.execute("""
+        SELECT GROUP_CONCAT(id) as ids
+        FROM photos
+        WHERE phash IS NOT NULL AND phash NOT LIKE 'ERR:%'
+        GROUP BY phash HAVING COUNT(*) > 1
+    """).fetchall()
+    id_groups = [[int(x) for x in g["ids"].split(",")] for g in groups]
+    merged_groups, removed_photos = merge_photo_groups(db, id_groups)
     db.close()
     return {"merged_groups": merged_groups, "removed_photos": removed_photos}
 
@@ -1735,7 +1882,7 @@ def search_tags(q: str = "", limit: int = 20, user=Depends(current_user)):
 def get_photo_tags(photo_id: int, user=Depends(current_user)):
     db = get_db()
     rows = db.execute("""
-        SELECT t.id as tag_id, t.name as tag_name, u.username, pt.user_id, pt.is_suggestion
+        SELECT t.id as tag_id, t.name as tag_name, t.category, u.username, pt.user_id, pt.is_suggestion
         FROM photo_tags pt
         JOIN tags t ON t.id = pt.tag_id
         JOIN users u ON u.id = pt.user_id
@@ -1743,13 +1890,14 @@ def get_photo_tags(photo_id: int, user=Depends(current_user)):
         ORDER BY t.name
     """, (photo_id,)).fetchall()
     db.close()
-    mine = [{"id": r["tag_id"], "name": r["tag_name"]} for r in rows if r["user_id"] == user["id"] and not r["is_suggestion"]]
+    mine = [{"id": r["tag_id"], "name": r["tag_name"], "is_character": r["category"] == 4}
+            for r in rows if r["user_id"] == user["id"] and not r["is_suggestion"]]
     all_tags = [{"tag_id": r["tag_id"], "tag_name": r["tag_name"], "username": r["username"],
-                 "is_suggestion": bool(r["is_suggestion"])} for r in rows]
+                 "is_suggestion": bool(r["is_suggestion"]), "is_character": r["category"] == 4} for r in rows]
     return {"mine": mine, "all": all_tags}
 
 @app.post("/api/photo-tags/{photo_id}/add")
-def add_photo_tag(photo_id: int, tag_name: str = Form(...), user=Depends(current_user)):
+async def add_photo_tag(photo_id: int, tag_name: str = Form(...), user=Depends(current_user)):
     db = get_db()
     # find by name (case-insensitive)
     tag = db.execute("SELECT id FROM tags WHERE LOWER(name)=LOWER(?)", (tag_name.strip(),)).fetchone()
@@ -1764,10 +1912,11 @@ def add_photo_tag(photo_id: int, tag_name: str = Form(...), user=Depends(current
     except sqlite3.IntegrityError:
         pass
     db.close()
+    await ws_manager.broadcast({"type": "tags_updated", "photo_id": photo_id})
     return {"ok": True}
 
 @app.post("/api/photo-tags/{photo_id}/confirm")
-def confirm_suggested_tag(photo_id: int, tag_id: int = Form(...), user=Depends(current_user)):
+async def confirm_suggested_tag(photo_id: int, tag_id: int = Form(...), user=Depends(current_user)):
     """
     Подтверждает предложенный автотегированием тег: снимает флаг is_suggestion,
     после чего тег сразу считается обычным — виден в тир-листе, фильтрах
@@ -1785,10 +1934,11 @@ def confirm_suggested_tag(photo_id: int, tag_id: int = Form(...), user=Depends(c
     db.execute("UPDATE photo_tags SET is_suggestion=0 WHERE id=?", (row["id"],))
     db.commit()
     db.close()
+    await ws_manager.broadcast({"type": "tags_updated", "photo_id": photo_id})
     return {"ok": True}
 
 @app.post("/api/photo-tags/{photo_id}/reject")
-def reject_suggested_tag(photo_id: int, tag_id: int = Form(...), user=Depends(current_user)):
+async def reject_suggested_tag(photo_id: int, tag_id: int = Form(...), user=Depends(current_user)):
     """
     Отклоняет предложенный автотегированием тег — полностью удаляет
     запись-предложение. Это явное "нет, это неверно" от любого человека,
@@ -1802,14 +1952,16 @@ def reject_suggested_tag(photo_id: int, tag_id: int = Form(...), user=Depends(cu
     )
     db.commit()
     db.close()
+    await ws_manager.broadcast({"type": "tags_updated", "photo_id": photo_id})
     return {"ok": True}
 
 @app.delete("/api/photo-tags/{photo_id}/{tag_id}")
-def remove_photo_tag(photo_id: int, tag_id: int, user=Depends(current_user)):
+async def remove_photo_tag(photo_id: int, tag_id: int, user=Depends(current_user)):
     db = get_db()
     db.execute("DELETE FROM photo_tags WHERE photo_id=? AND user_id=? AND tag_id=?",
                (photo_id, user["id"], tag_id))
     db.commit(); db.close()
+    await ws_manager.broadcast({"type": "tags_updated", "photo_id": photo_id})
     return {"ok": True}
 
 @app.get("/api/sessions/{session_id}/photo-votes/{photo_id}")
@@ -1877,7 +2029,7 @@ def photo_detail(session_id: int, photo_id: int, user=Depends(current_user)):
 def require_session_owner(db, session_id: int, user) -> sqlite3.Row:
     """Возвращает сессию, если вызывающий — её создатель (или сайт-админ),
     иначе бросает 403. Используется во всех управляющих сессией endpoint'ах
-    (next/prev/set photo, shuffle, close-voting, auto-advance, tiers)."""
+    (next/prev/set photo, shuffle, auto-advance, tiers)."""
     session = get_session_or_404(db, session_id)
     if session["creator_user_id"] != user["id"] and not user["is_admin"]:
         db.close()
@@ -1966,16 +2118,6 @@ async def shuffle_photos(session_id: int, user=Depends(current_user)):
         await ws_manager.broadcast({"type": "photo_change", "photo_id": first_id}, session_id)
     return {"ok": True, "count": len(ids), "first_id": first_id}
 
-@app.post("/api/sessions/{session_id}/close-voting")
-async def close_voting(session_id: int, user=Depends(current_user)):
-    db = get_db()
-    require_session_owner(db, session_id, user)
-    db.execute("UPDATE sessions SET voting_open=0 WHERE id=?", (session_id,))
-    db.commit()
-    db.close()
-    await ws_manager.broadcast({"type": "voting_closed"}, session_id)
-    return {"ok": True}
-
 @app.post("/api/sessions/{session_id}/auto-advance")
 async def set_auto_advance(session_id: int, enabled: bool = Form(...), user=Depends(current_user)):
     db = get_db()
@@ -1994,7 +2136,7 @@ def get_auto_advance(session_id: int, user=Depends(current_user)):
     return {"enabled": bool(session["auto_advance"])}
 
 @app.get("/api/admin/wd14-status")
-def get_wd14_status(user=Depends(current_user)):
+def get_wd14_status(user=Depends(admin_user)):
     """
     Статус автотегирования для админ-панели: проверяет не только наличие
     файлов модели, но и их реальный размер (см. wd14_tagger.is_available) —
@@ -2047,6 +2189,27 @@ def random_photo_preview(user=Depends(current_user)):
     db.close()
     return {"filename": row["filename"] if row else None}
 
+@app.get("/api/photos/new-info")
+def new_photos_info(user=Depends(current_user)):
+    """
+    Сколько фото ещё не входят в текущий опубликованный на главной тир-лист
+    (плюс превью одного из них) — для карточки-альбома "Новые фото" в форме
+    создания сессии. Если на главной ничего не опубликовано, "новыми"
+    считаются все фото на сайте.
+    """
+    db = get_db()
+    published_ids = get_published_photo_ids(db)
+    if published_ids:
+        placeholders = ",".join("?" * len(published_ids))
+        rows = db.execute(
+            f"SELECT id, filename FROM photos WHERE id NOT IN ({placeholders}) ORDER BY RANDOM()",
+            list(published_ids)
+        ).fetchall()
+    else:
+        rows = db.execute("SELECT id, filename FROM photos ORDER BY RANDOM()").fetchall()
+    db.close()
+    return {"count": len(rows), "preview_filename": rows[0]["filename"] if rows else None}
+
 @app.get("/api/tierlist/tags")
 def tierlist_tags(include_suggestions: bool = False, q: str = "", user=Depends(current_user)):
     """
@@ -2090,7 +2253,7 @@ def tierlist_tags(include_suggestions: bool = False, q: str = "", user=Depends(c
         limit_clause = ""
 
     rows = db.execute(f"""
-        SELECT t.id, t.name,
+        SELECT t.id, t.name, t.category,
                COUNT(DISTINCT pt.photo_id) as photo_count,
                MAX(CASE WHEN pt.is_suggestion = 0 THEN 1 ELSE 0 END) as has_confirmed
         FROM tags t
@@ -2123,6 +2286,7 @@ def tierlist_tags(include_suggestions: bool = False, q: str = "", user=Depends(c
             "has_confirmed": bool(r["has_confirmed"]),
             "preview_filename": preview_by_tag.get(r["id"]),
             "is_favorite": r["id"] in favorite_ids,
+            "is_character": r["category"] == 4,
         })
 
     db.close()
