@@ -51,9 +51,10 @@
     <header class="topbar">
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
-        <span id="sessions-nav-username"></span>
+        <span id="sessions-nav-username" class="nav-username-link" onclick="showUserProfile(me.id)" title="Мой профиль"></span>
         <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
         <button class="nav-btn" onclick="showGallery()">Галерея</button>
+        <button class="nav-btn" onclick="showUsersDirectory()">Участники</button>
         <button class="nav-btn photo-manager-nav-btn" onclick="showPhotoManager()" style="display:none">Управление фото</button>
         <button class="nav-btn" onclick="logout()">Выйти</button>
       </nav>
@@ -292,9 +293,10 @@
     <header class="topbar">
       <div class="logo-sm">PHOTO<span>RANK</span></div>
       <nav class="topbar-nav">
-        <span id="gallery-nav-username"></span>
+        <span id="gallery-nav-username" class="nav-username-link" onclick="showUserProfile(me.id)" title="Мой профиль"></span>
         <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
         <button class="nav-btn" onclick="showPublishedTierlist()">Тир-лист</button>
+        <button class="nav-btn" onclick="showUsersDirectory()">Участники</button>
         <button class="nav-btn" onclick="showSessionsList()">Сессии</button>
         <button class="nav-btn photo-manager-nav-btn" onclick="showPhotoManager()" style="display:none">Управление фото</button>
         <button class="nav-btn" id="btn-publish-tierlist" onclick="openPublishTierlistModal()" title="Опубликовать тир-лист сессии" style="display:none">Опубликовать</button>
@@ -374,6 +376,38 @@
         <div id="publishable-sessions-list" class="sessions-list"></div>
       </div>
     </div>
+  </div>
+
+  <!-- USERS DIRECTORY (список участников, открывается с главной, вне сессии) -->
+  <div id="screen-users-directory" class="screen">
+    <header class="topbar">
+      <div class="logo-sm">PHOTO<span>RANK</span></div>
+      <nav class="topbar-nav">
+        <button class="nav-btn" onclick="showGallery()">← Назад</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
+      </nav>
+    </header>
+    <main class="sessions-main">
+      <div class="sessions-header"><h1>Участники</h1></div>
+      <div class="sessions-join-row">
+        <input type="text" id="users-directory-search" placeholder="Поиск по имени..." class="yadisk-input" oninput="renderUsersDirectory(this.value)">
+      </div>
+      <div id="users-directory-list" class="sessions-list"></div>
+    </main>
+  </div>
+
+  <!-- USER PROFILE (глобальный, не зависит от сессии) -->
+  <div id="screen-user-profile" class="screen">
+    <header class="topbar">
+      <div class="logo-sm">PHOTO<span>RANK</span></div>
+      <nav class="topbar-nav">
+        <button class="nav-btn" onclick="showGallery()">← Назад</button>
+        <button class="nav-btn theme-toggle-icon-target" onclick="toggleTheme()" title="Сменить тему">Тёмная тема</button>
+      </nav>
+    </header>
+    <main class="gp-main" id="profile-main">
+      <div class="gp-loading">Загрузка профиля...</div>
+    </main>
   </div>
 
   <!-- PHOTO MANAGER (глобальное, не зависит от сессии) -->
@@ -506,6 +540,10 @@
             <div class="up-bar"><div class="up-fill" id="up-fill"></div></div>
             <div class="up-label" id="up-label"></div>
           </div>
+          <div class="admin-card-divider"></div>
+          <p class="hint">Скопировали фото прямо на сервер (scp, docker cp, для больших партий в тысячи файлов) в обход загрузки через браузер? Нажмите, чтобы найти такие файлы и зарегистрировать их в базе — с автотегированием, как при обычной загрузке.</p>
+          <div id="scan-folder-status" class="hint"></div>
+          <button class="btn-secondary" id="scan-folder-btn" onclick="scanPhotosFolder()">Просканировать папку photos/</button>
         </div>
 
         <div class="admin-card">

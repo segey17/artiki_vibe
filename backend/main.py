@@ -105,10 +105,13 @@ async def websocket_endpoint(ws: WebSocket, token: Optional[str] = None, session
 
 SECRET = os.getenv("JWT_SECRET", "change-me-in-production-please")
 PHOTOS_DIR = "/app/photos"
+THUMBS_DIR = "/app/photos/_thumbs"  # уменьшенные превью для сетки/карточек — считаются лениво, по первому запросу
+THUMB_MAX_SIZE = 320  # px по длинной стороне
 DB_PATH = "/app/data/db.sqlite3"
 AUTO_TAGGER_USERNAME = "auto-tagger"  # системный "пользователь", от имени которого пишутся автотеги
 GOOGLE_DRIVE_API_KEY = os.getenv("GOOGLE_DRIVE_API_KEY", "")  # для доступа к публичным папкам Google Drive
 os.makedirs(PHOTOS_DIR, exist_ok=True)
+os.makedirs(THUMBS_DIR, exist_ok=True)
 os.makedirs("/app/data", exist_ok=True)
 
 security = HTTPBearer(auto_error=False)
@@ -395,25 +398,16 @@ def get_tiers_for_session(session_row):
     except: pass
     return DEFAULT_TIERS[:]
 
-def get_favorite_tag_ids_for_user(db, user_id: int, limit: int = 20) -> list[int]:
+def get_top_rated_photo_ids_for_user(db, user_id: int) -> set:
     """
-    Любимые теги пользователя по ВСЕМ его сессиям сразу — те же принципы,
-    что в /api/sessions/{id}/user-stats/{uid} (топ-теги по высоко оценённым
-    фото), только не ограничены одной сессией. Используется для приоритизации
-    списка тегов в форме создания новой сессии: тегам, которые человек
-    регулярно ставил высокую оценку, нужно показываться первыми.
-
-    "Высоко оценённое" определяется как верхняя половина тиров В РАМКАХ
-    КАЖДОЙ СЕССИИ — так как тиры разные в разных сессиях, нет единого
-    глобального "верхнего тира", но относительная позиция (верхняя половина
-    своего же набора тиров) сопоставима между сессиями.
+    Общая часть для "любимых тегов": собирает id фото, которым пользователь
+    поставил оценку из верхней половины тиров — по ВСЕМ его сессиям сразу.
+    "Верхняя половина" считается в рамках КАЖДОЙ сессии отдельно (тиры в
+    разных сессиях разные, но относительная позиция сопоставима).
     """
     sessions_rated = db.execute(
         "SELECT DISTINCT session_id FROM ratings WHERE user_id=?", (user_id,)
     ).fetchall()
-    if not sessions_rated:
-        return []
-
     top_photo_ids = set()
     for srow in sessions_rated:
         sid = srow["session_id"]
@@ -432,10 +426,19 @@ def get_favorite_tag_ids_for_user(db, user_id: int, limit: int = 20) -> list[int
             [sid, user_id] + top_tier_ids
         ).fetchall()
         top_photo_ids.update(r["photo_id"] for r in rows)
+    return top_photo_ids
 
+def get_favorite_tag_ids_for_user(db, user_id: int, limit: int = 20) -> list:
+    """
+    Любимые теги пользователя по ВСЕМ его сессиям сразу — те же принципы,
+    что в /api/sessions/{id}/user-stats/{uid} (топ-теги по высоко оценённым
+    фото), только не ограничены одной сессией. Используется для приоритизации
+    списка тегов в форме создания новой сессии: тегам, которые человек
+    регулярно ставил высокую оценку, нужно показываться первыми.
+    """
+    top_photo_ids = get_top_rated_photo_ids_for_user(db, user_id)
     if not top_photo_ids:
         return []
-
     pp = ",".join("?" * len(top_photo_ids))
     rows = db.execute(
         f"SELECT tag_id, COUNT(*) as cnt FROM photo_tags "
@@ -444,6 +447,25 @@ def get_favorite_tag_ids_for_user(db, user_id: int, limit: int = 20) -> list[int
         list(top_photo_ids) + [limit]
     ).fetchall()
     return [r["tag_id"] for r in rows]
+
+def get_favorite_tags_detailed_for_user(db, user_id: int, limit: int = 12) -> list:
+    """
+    То же самое, что get_favorite_tag_ids_for_user, но с именем тега,
+    счётчиком и категорией (персонаж/общий) — для показа на странице
+    профиля пользователя, а не только как список id для внутренней логики.
+    """
+    top_photo_ids = get_top_rated_photo_ids_for_user(db, user_id)
+    if not top_photo_ids:
+        return []
+    pp = ",".join("?" * len(top_photo_ids))
+    rows = db.execute(
+        f"SELECT t.id, t.name, t.category, COUNT(*) as cnt "
+        f"FROM photo_tags pt JOIN tags t ON t.id = pt.tag_id "
+        f"WHERE pt.photo_id IN ({pp}) AND pt.is_suggestion=0 "
+        f"GROUP BY t.id ORDER BY cnt DESC LIMIT ?",
+        list(top_photo_ids) + [limit]
+    ).fetchall()
+    return [{"id": r["id"], "name": r["name"], "count": r["cnt"], "is_character": r["category"] == 4} for r in rows]
 
 def get_session_or_404(db, session_id: int):
     row = db.execute("SELECT * FROM sessions WHERE id=? AND is_active=1", (session_id,)).fetchone()
@@ -516,12 +538,77 @@ async def auto_tag_photo_async(photo_id: int, photo_path: str):
     run_in_executor, чтобы не подвешивать event loop FastAPI (другие запросы,
     WebSocket и т.п.) на время распознавания тегов.
     Любая ошибка здесь гасится — тегирование не должно прерывать загрузку фото.
+
+    Для ОДНОГО фото за раз (ручная загрузка через интерфейс). Для массовой
+    обработки (импорт, синхронизация, сканирование папки) используйте
+    auto_tag_photos_batch_async — она прогоняет все фото через модель одним
+    батчем вместо по одному, что на CPU заметно быстрее суммарно.
     """
     loop = asyncio.get_event_loop()
     try:
         await loop.run_in_executor(None, auto_tag_photo, photo_id, photo_path)
     except Exception as e:
         print(f"[auto_tag_photo_async] Пропускаем автотегирование фото {photo_id}: {e}")
+
+def _auto_tag_photos_batch(new_photos: list):
+    """
+    Синхронная часть батчевого автотегирования — прогоняет СРАЗУ ВСЕ
+    переданные фото через WD14 одним проходом (см. wd14_tagger.predict_tag_ids_batch),
+    а не по одному, и пишет все найденные предложения тегов в БД одним
+    заходом. Выполняется в отдельном треде (см. auto_tag_photos_batch_async),
+    как и одиночная версия auto_tag_photo.
+    """
+    if not new_photos:
+        return
+    photo_ids = [pid for pid, _ in new_photos]
+    paths = [path for _, path in new_photos]
+    tag_ids_per_photo = wd14_tagger.predict_tag_ids_batch(paths)
+
+    db = get_db()
+    try:
+        tagger_id = _get_auto_tagger_user_id(db)
+        if tagger_id is None:
+            return
+        # какие из предложенных моделью tag_id реально есть в таблице tags —
+        # проверяем один раз по объединению всех id со всех фото сразу,
+        # а не отдельным запросом на каждое фото.
+        all_ids = sorted(set(tid for tags in tag_ids_per_photo for tid in tags))
+        if not all_ids:
+            return
+        existing = set(
+            r["id"] for r in db.execute(
+                "SELECT id FROM tags WHERE id IN ({})".format(",".join("?" * len(all_ids))),
+                all_ids
+            ).fetchall()
+        )
+        rows = [
+            (photo_id, tagger_id, tid)
+            for photo_id, tags in zip(photo_ids, tag_ids_per_photo)
+            for tid in tags if tid in existing
+        ]
+        if rows:
+            db.executemany(
+                "INSERT OR IGNORE INTO photo_tags (photo_id, user_id, tag_id, is_suggestion) VALUES (?,?,?,1)",
+                rows
+            )
+            db.commit()
+    finally:
+        db.close()
+
+async def auto_tag_photos_batch_async(new_photos: list):
+    """
+    Асинхронная обёртка над _auto_tag_photos_batch — используется во всех
+    точках массового добавления фото (импорт с Яндекс/Google Диска,
+    авто-синхронизация, сканирование папки на сервере) вместо цикла с
+    отдельным auto_tag_photo_async на каждое фото.
+    """
+    if not new_photos:
+        return
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, _auto_tag_photos_batch, new_photos)
+    except Exception as e:
+        print(f"[auto_tag_photos_batch_async] Пропускаем автотегирование партии из {len(new_photos)} фото: {e}")
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 
@@ -608,7 +695,9 @@ def create_session(body: dict, user=Depends(current_user)):
       photo_filter: "all" | "tag" | "new" — какая подборка фото войдёт в сессию
                     ("new" — фото, которых ещё нет в опубликованном на главной
                     тир-листе)
-      tag_id: int (если photo_filter == "tag") — id тега для фильтра
+      tag_ids: list[int] (если photo_filter == "tag") — id тегов для фильтра;
+               фото попадает в сессию, только если у него есть ВСЕ
+               перечисленные теги (логика "И", а не "ИЛИ")
       include_suggestions: bool — включать ли фото, у которых тег есть
                             только как неподтверждённое предложение AI
       shuffle: bool — перемешать порядок фото в сессии (по умолчанию — да)
@@ -628,21 +717,21 @@ def create_session(body: dict, user=Depends(current_user)):
         t["color"] = t.get("color", "#888")
 
     photo_filter = body.get("photo_filter", "all")
-    tag_id = body.get("tag_id")
+    tag_ids = [int(x) for x in (body.get("tag_ids") or []) if x is not None]
     include_suggestions = bool(body.get("include_suggestions"))
     do_shuffle = body.get("shuffle", True)
 
     db = get_db()
 
-    if photo_filter == "tag" and tag_id:
-        if include_suggestions:
-            rows = db.execute(
-                "SELECT DISTINCT photo_id FROM photo_tags WHERE tag_id=?", (tag_id,)
-            ).fetchall()
-        else:
-            rows = db.execute(
-                "SELECT DISTINCT photo_id FROM photo_tags WHERE tag_id=? AND is_suggestion=0", (tag_id,)
-            ).fetchall()
+    if photo_filter == "tag" and tag_ids:
+        suggestion_clause = "" if include_suggestions else "AND is_suggestion=0"
+        placeholders = ",".join("?" * len(tag_ids))
+        rows = db.execute(f"""
+            SELECT photo_id FROM photo_tags
+            WHERE tag_id IN ({placeholders}) {suggestion_clause}
+            GROUP BY photo_id
+            HAVING COUNT(DISTINCT tag_id) = ?
+        """, (*tag_ids, len(tag_ids))).fetchall()
         photo_ids = [r["photo_id"] for r in rows]
     elif photo_filter == "new":
         published_ids = get_published_photo_ids(db)
@@ -735,34 +824,39 @@ def end_session(session_id: int, user=Depends(current_user)):
 # сайт-админ явно публикует на главную (см. ниже).
 
 @app.get("/api/gallery/photos")
-def gallery_photos(tag_id: Optional[int] = None, include_suggestions: bool = False,
+def gallery_photos(tag_ids: Optional[str] = None, include_suggestions: bool = False,
                     page: int = 1, page_size: int = 30, user=Depends(current_user)):
     """
     Список фото для галереи, постранично ("выпусками") — чтобы не листать
-    тысячи фото одной бесконечной лентой. tag_id — необязательный фильтр
-    (показывать только фото с этим тегом). include_suggestions согласуется
-    с тем же переключателем, что в /api/gallery/tags — если включён, фильтр
-    по тегу учитывает и неподтверждённые AI-предложения (иначе выбор AI-тега
-    в фильтре вернул бы пустой список, хотя сам тег показывается).
+    тысячи фото одной бесконечной лентой. tag_ids — необязательный фильтр,
+    список id тегов через запятую (например "3,7,12"); если задано несколько —
+    фото должно иметь ВСЕ перечисленные теги (логика "И", а не "ИЛИ").
+    include_suggestions согласуется с тем же переключателем, что в
+    /api/gallery/tags — если включён, фильтр учитывает и неподтверждённые
+    AI-предложения (иначе выбор AI-тега в фильтре вернул бы пустой список,
+    хотя сам тег показывается).
     """
     page = max(1, page)
     page_size = max(1, min(page_size, 200))
     offset = (page - 1) * page_size
     db = get_db()
-    if tag_id:
-        suggestion_clause = "" if include_suggestions else "AND pt.is_suggestion = 0"
-        total = db.execute(f"""
-            SELECT COUNT(DISTINCT p.id) as c
-            FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id
-            WHERE pt.tag_id = ? {suggestion_clause}
-        """, (tag_id,)).fetchone()["c"]
+    ids = [int(x) for x in tag_ids.split(",") if x.strip().isdigit()] if tag_ids else []
+    if ids:
+        suggestion_clause = "" if include_suggestions else "AND is_suggestion = 0"
+        placeholders = ",".join("?" * len(ids))
+        match_subquery = f"""
+            SELECT photo_id FROM photo_tags
+            WHERE tag_id IN ({placeholders}) {suggestion_clause}
+            GROUP BY photo_id
+            HAVING COUNT(DISTINCT tag_id) = ?
+        """
+        total = db.execute(f"SELECT COUNT(*) as c FROM ({match_subquery})", (*ids, len(ids))).fetchone()["c"]
         rows = db.execute(f"""
-            SELECT DISTINCT p.id, p.filename, p.original_name, p.position
-            FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id
-            WHERE pt.tag_id = ? {suggestion_clause}
-            ORDER BY p.position
+            SELECT id, filename, original_name, position FROM photos
+            WHERE id IN ({match_subquery})
+            ORDER BY position
             LIMIT ? OFFSET ?
-        """, (tag_id, page_size, offset)).fetchall()
+        """, (*ids, len(ids), page_size, offset)).fetchall()
     else:
         total = db.execute("SELECT COUNT(*) as c FROM photos").fetchone()["c"]
         rows = db.execute(
@@ -1117,8 +1211,7 @@ async def import_yadisk(public_url: str = Form(...), user=Depends(admin_user)):
 
     # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
     # фото всё равно уже импортированы выше.
-    for photo_id, path in new_photos:
-        await auto_tag_photo_async(photo_id, path)
+    await auto_tag_photos_batch_async(new_photos)
 
     return {
         "total_found": len(all_files),
@@ -1209,8 +1302,7 @@ async def yadisk_sync_once() -> dict:
 
         # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
         # фото всё равно уже синхронизированы выше.
-        for photo_id, path in new_photos:
-            await auto_tag_photo_async(photo_id, path)
+        await auto_tag_photos_batch_async(new_photos)
 
         if added > 0:
             await ws_manager.broadcast({"type": "photos_updated", "added": added})
@@ -1342,8 +1434,7 @@ async def import_gdrive(folder_url: str = Form(...), user=Depends(admin_user)):
 
     # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
     # фото всё равно уже импортированы выше.
-    for photo_id, path in new_photos:
-        await auto_tag_photo_async(photo_id, path)
+    await auto_tag_photos_batch_async(new_photos)
 
     return {
         "total_found": len(all_files),
@@ -1435,8 +1526,7 @@ async def gdrive_sync_once() -> dict:
 
         # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
         # фото всё равно уже синхронизированы выше.
-        for photo_id, path in new_photos:
-            await auto_tag_photo_async(photo_id, path)
+        await auto_tag_photos_batch_async(new_photos)
 
         if added > 0:
             await ws_manager.broadcast({"type": "photos_updated", "added": added})
@@ -1537,10 +1627,52 @@ async def upload_photos(files: list[UploadFile] = File(...), user=Depends(admin_
 
     # Автотегирование WD14 — по договорённости: при ошибке/недоступности модели
     # просто пропускаем, фото всё равно уже загружено выше.
-    for photo_id, path in new_photos:
-        await auto_tag_photo_async(photo_id, path)
+    await auto_tag_photos_batch_async(new_photos)
 
     return {"added": added}
+
+@app.post("/api/admin/photos/scan-folder")
+async def scan_photos_folder(user=Depends(admin_user)):
+    """
+    Сканирует папку /app/photos и регистрирует в БД файлы, которых там ещё
+    нет — для случая, когда фото скопировали на сервер напрямую (scp, docker cp
+    и т.п.), в обход загрузки через интерфейс. В отличие от такого копирования
+    "вручную", здесь позиция новых фото корректно продолжает уже существующие
+    (а не начинается заново с нуля), и для каждого нового файла запускается
+    то же автотегирование WD14, что и при обычной загрузке. Запускается
+    только по кнопке в "Управление фото", не автоматически при каждом запуске
+    сервера — сканирование тысяч файлов может занять время.
+    """
+    db = get_db()
+    existing = {r["filename"] for r in db.execute("SELECT filename FROM photos").fetchall()}
+    try:
+        all_files = sorted(os.listdir(PHOTOS_DIR))
+    except FileNotFoundError:
+        db.close()
+        return {"added": 0, "skipped": 0, "total_found": 0}
+
+    candidates = [f for f in all_files
+                  if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+                  and f not in existing]
+
+    new_photos = []  # (photo_id, full_path) — для автотегирования после вставки
+    skipped = 0
+    for f in candidates:
+        path = os.path.join(PHOTOS_DIR, f)
+        try:
+            img = PILImage.open(path); img.load()
+        except Exception:
+            skipped += 1
+            continue
+        count = db.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+        cur = db.execute("INSERT INTO photos (filename, original_name, position) VALUES (?,?,?)",
+                          (f, f, count))
+        new_photos.append((cur.lastrowid, path))
+    db.commit(); db.close()
+
+    await auto_tag_photos_batch_async(new_photos)
+
+    return {"added": len(new_photos), "skipped": skipped, "total_found": len(candidates)}
 
 @app.get("/api/admin/photos")
 def admin_photos(user=Depends(admin_user)):
@@ -1564,6 +1696,29 @@ def delete_photo(pid: int, user=Depends(admin_user)):
         db.execute("DELETE FROM photo_tags WHERE photo_id=?", (pid,))
         db.commit()
     db.close(); return {"ok": True}
+
+def generate_thumbnail(filename: str):
+    """
+    Создаёт уменьшенную копию фото (до THUMB_MAX_SIZE px по длинной стороне,
+    JPEG) в THUMBS_DIR — считается лениво, по первому запросу превью,
+    результат кэшируется на диске навсегда (пока исходный файл не удалят).
+    Раздельный от оригинала JPEG нужен, чтобы сетка/карточки не тянули
+    полноразмерные файлы там, где реально показывается миниатюра 140-320px.
+    Возвращает путь к готовому превью или None, если файл не читается как
+    изображение.
+    """
+    thumb_path = os.path.join(THUMBS_DIR, filename + ".jpg")
+    if os.path.exists(thumb_path):
+        return thumb_path
+    src_path = os.path.join(PHOTOS_DIR, filename)
+    try:
+        img = PILImage.open(src_path)
+        img = img.convert("RGB")
+        img.thumbnail((THUMB_MAX_SIZE, THUMB_MAX_SIZE), PILImage.LANCZOS)
+        img.save(thumb_path, "JPEG", quality=80)
+        return thumb_path
+    except Exception:
+        return None
 
 def compute_dhash(path: str, hash_size: int = 8):
     """
@@ -2408,6 +2563,23 @@ def reset_db(user=Depends(admin_user)):
     db.close()
     return {"ok": True}
 
+@app.get("/api/users")
+def list_all_users(user=Depends(current_user)):
+    """
+    Лёгкий список всех обычных (не системных) пользователей сайта —
+    для страницы "Участники", откуда можно открыть чей-то профиль прямо
+    с главной страницы, не заходя в сессию. В отличие от /api/admin/users
+    (панель администратора, полное управление аккаунтами), этот эндпоинт
+    открыт любому залогиненному человеку и отдаёт только базовые публичные
+    поля.
+    """
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, username, is_admin FROM users WHERE is_system=0 ORDER BY username COLLATE NOCASE"
+    ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
 @app.get("/api/admin/users")
 def list_users(user=Depends(admin_user)):
     db = get_db()
@@ -2418,6 +2590,60 @@ def list_users(user=Depends(admin_user)):
 def make_admin_user(uid: int, user=Depends(admin_user)):
     db = get_db(); db.execute("UPDATE users SET is_admin=1 WHERE id=?", (uid,)); db.commit(); db.close()
     return {"ok": True}
+
+@app.get("/api/users/{uid}/profile")
+def get_user_profile(uid: int, user=Depends(current_user)):
+    """
+    Глобальный профиль пользователя — агрегирует активность по ВСЕМ его
+    сессиям сразу (в отличие от /api/sessions/{id}/user-stats/{uid}, который
+    считает статистику только в рамках одной конкретной сессии). Доступен
+    любому залогиненному человеку, не только владельцу профиля — так же,
+    как список участников и сравнение уже открыты всем внутри сессии.
+    """
+    db = get_db()
+    profile_user = db.execute(
+        "SELECT id, username, is_admin, created_at FROM users WHERE id=? AND is_system=0", (uid,)
+    ).fetchone()
+    if not profile_user:
+        db.close()
+        raise HTTPException(404, "Пользователь не найден")
+
+    total_votes = db.execute("SELECT COUNT(*) as c FROM ratings WHERE user_id=?", (uid,)).fetchone()["c"]
+    sessions_participated = db.execute(
+        "SELECT COUNT(DISTINCT session_id) as c FROM ratings WHERE user_id=?", (uid,)
+    ).fetchone()["c"]
+    sessions_created = db.execute(
+        "SELECT COUNT(*) as c FROM sessions WHERE creator_user_id=?", (uid,)
+    ).fetchone()["c"]
+    tags_added = db.execute(
+        "SELECT COUNT(*) as c FROM photo_tags WHERE user_id=? AND is_suggestion=0", (uid,)
+    ).fetchone()["c"]
+    last_active = db.execute(
+        "SELECT MAX(created_at) as m FROM ratings WHERE user_id=?", (uid,)
+    ).fetchone()["m"]
+
+    # "щедрость" оценок — какая доля голосов пришлась на верхнюю половину
+    # тиров (своих же, в рамках каждой сессии) — просто любопытная метрика,
+    # не влияет ни на что в самом приложении.
+    top_photo_ids = get_top_rated_photo_ids_for_user(db, uid)
+    top_half_pct = round(100 * len(top_photo_ids) / total_votes) if total_votes else 0
+
+    favorite_tags = get_favorite_tags_detailed_for_user(db, uid, limit=12)
+    db.close()
+
+    return {
+        "id": profile_user["id"],
+        "username": profile_user["username"],
+        "is_admin": bool(profile_user["is_admin"]),
+        "member_since": profile_user["created_at"],
+        "total_votes": total_votes,
+        "sessions_participated": sessions_participated,
+        "sessions_created": sessions_created,
+        "tags_added": tags_added,
+        "last_active": last_active,
+        "top_half_pct": top_half_pct,
+        "favorite_tags": favorite_tags,
+    }
 
 
 @app.get("/api/sessions/{session_id}/users-list")
@@ -2578,6 +2804,26 @@ def compare_users(session_id: int, uid1: int, uid2: int, user=Depends(current_us
         "similarity": similarity,
         "disagreements": disagreements[:20],
     }
+
+@app.get("/thumbs/{filename}")
+def get_thumbnail(filename: str):
+    """
+    Уменьшенное превью фото — используется везде, где в интерфейсе нужна
+    маленькая миниатюра (сетка галереи, тир-лист, карточки альбомов, таблица
+    в "Управление фото"), вместо того чтобы гонять по сети полноразмерный
+    оригинал ради картинки 140-320px. Генерируется лениво при первом
+    обращении и дальше отдаётся уже готовым файлом с длинным кэшем.
+    """
+    safe_name = os.path.basename(filename)  # защита от path traversal (../..)
+    thumb_path = generate_thumbnail(safe_name)
+    if not thumb_path:
+        # не удалось прочитать как изображение — отдаём оригинал как есть,
+        # чтобы миниатюра не была просто "битой картинкой" в интерфейсе
+        orig_path = os.path.join(PHOTOS_DIR, safe_name)
+        if not os.path.exists(orig_path):
+            raise HTTPException(404, "Фото не найдено")
+        return FileResponse(orig_path)
+    return FileResponse(thumb_path, headers={"Cache-Control": "public, max-age=604800, immutable"})
 
 app.mount("/photos", StaticFiles(directory=PHOTOS_DIR), name="photos")
 app.mount("/static", StaticFiles(directory="/app/frontend/static"), name="static")

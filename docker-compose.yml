@@ -10,4 +10,7 @@ services:
     environment:
       - JWT_SECRET=ЗАМЕНИТЕ_НА_СЛУЧАЙНУЮ_СТРОКУ_МИНИМУМ_32_СИМВОЛА
       - GOOGLE_DRIVE_API_KEY=AIzaSyCYm1G9wW_2hSb8cRb0_7F0vAbeAKrZ7ws # нужен только для автосинхронизации с Google Drive
+      # - WD14_GENERAL_THRESHOLD=0.40   # необязательно: порог уверенности для общих тегов
+      # - WD14_CHARACTER_THRESHOLD=0.50 # необязательно: порог уверенности для тегов-персонажей
+      # - WD14_BATCH_SIZE=8             # необязательно: сколько фото тегировать за один проход модели
     restart: unless-stopped

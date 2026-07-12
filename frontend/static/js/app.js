@@ -254,12 +254,14 @@ function openCreateSessionForm() {
 let allTagsForSessionCreate = [];      // топ-10 тегов от /api/tierlist/tags (с превью, is_favorite, has_confirmed)
 let allPhotosPreview = null;           // {filename} — случайное превью для плитки "Все фото"
 let newPhotosInfo = null;              // {count, preview_filename} — для плитки "Новые фото"
-let selectedAlbumId = 'all';           // 'all' | 'new' | tagId — что выбрано в сетке альбомов сейчас
+let selectedAlbumMode = 'all';         // 'all' | 'new' | 'tags' — что выбрано в сетке альбомов сейчас
+let selectedTagIds = new Set();        // используется при selectedAlbumMode === 'tags'; фото должно иметь ВСЕ выбранные теги (логика "И")
 
 async function loadTagOptionsForSessionCreate() {
   const grid = document.getElementById('tag-card-grid');
   grid.innerHTML = '<div class="tag-card-empty">Загрузка альбомов...</div>';
-  selectedAlbumId = 'all';
+  selectedAlbumMode = 'all';
+  selectedTagIds.clear();
   document.getElementById('tag-card-search').value = '';
   try {
     const [tagsList, allPreview, newInfo] = await Promise.all([
@@ -335,18 +337,18 @@ function renderTagCardGrid(query, searchResults) {
   let html = '';
   if (allCardMatches) {
     html += `
-      <div class="tag-card ${selectedAlbumId === 'all' ? 'selected' : ''}" data-album-id="all" onclick="selectAlbumCard('all')" title="Все фото">
+      <div class="tag-card ${selectedAlbumMode === 'all' ? 'selected' : ''}" data-album-id="all" onclick="selectAlbumCard('all')" title="Все фото">
         ${allPhotosPreview?.filename
-          ? `<img src="/photos/${allPhotosPreview.filename}" alt="" loading="lazy">`
+          ? `<img src="/thumbs/${allPhotosPreview.filename}" alt="" loading="lazy">`
           : `<div class="tag-card-noimg">🖼️</div>`}
         <div class="tag-card-overlay">Все фото</div>
       </div>`;
   }
   if (newCardMatches && newPhotosInfo) {
     html += `
-      <div class="tag-card ${selectedAlbumId === 'new' ? 'selected' : ''}" data-album-id="new" onclick="selectAlbumCard('new')" title="Новые фото — которых нет в опубликованном на главной тир-листе">
+      <div class="tag-card ${selectedAlbumMode === 'new' ? 'selected' : ''}" data-album-id="new" onclick="selectAlbumCard('new')" title="Новые фото — которых нет в опубликованном на главной тир-листе">
         ${newPhotosInfo.preview_filename
-          ? `<img src="/photos/${newPhotosInfo.preview_filename}" alt="" loading="lazy">`
+          ? `<img src="/thumbs/${newPhotosInfo.preview_filename}" alt="" loading="lazy">`
           : `<div class="tag-card-noimg">🆕</div>`}
         <span class="tag-card-ai-badge" style="background:var(--success, #2fb380)">новое</span>
         <div class="tag-card-overlay">Новые фото <span class="tag-card-count">${newPhotosInfo.count}</span></div>
@@ -354,9 +356,9 @@ function renderTagCardGrid(query, searchResults) {
   }
 
   const cardHtml = t => `
-    <div class="tag-card ${t.id === selectedAlbumId ? 'selected' : ''}" data-album-id="${t.id}" onclick="selectAlbumCard(${t.id})" title="${escapeHtml(t.name)}">
+    <div class="tag-card ${selectedTagIds.has(t.id) ? 'selected' : ''}" data-album-id="${t.id}" onclick="selectAlbumCard(${t.id})" title="${escapeHtml(t.name)}">
       ${t.preview_filename
-        ? `<img src="/photos/${t.preview_filename}" alt="" loading="lazy">`
+        ? `<img src="/thumbs/${t.preview_filename}" alt="" loading="lazy">`
         : `<div class="tag-card-noimg">🏷️</div>`}
       ${t.is_favorite ? '<span class="tag-card-fav-badge" title="Один из ваших любимых тегов">⭐</span>' : ''}
       ${!t.has_confirmed ? '<span class="tag-card-ai-badge">только AI</span>' : ''}
@@ -378,27 +380,46 @@ function renderTagCardGrid(query, searchResults) {
 }
 
 function selectAlbumCard(albumId) {
-  selectedAlbumId = albumId;
+  if (albumId === 'all' || albumId === 'new') {
+    // "Все фото" и "Новые фото" — режимы, взаимоисключающие с выбором тегов:
+    // выбор любого из них сбрасывает ранее отмеченные теги.
+    selectedAlbumMode = albumId;
+    selectedTagIds.clear();
+    document.querySelectorAll('.tag-card').forEach(el => {
+      el.classList.toggle('selected', el.dataset.albumId === albumId);
+    });
+    return;
+  }
+  // Тег можно выбрать сразу несколько — в сессию попадут фото, у которых
+  // есть ВСЕ отмеченные теги одновременно (логика "И", а не "ИЛИ").
+  if (selectedTagIds.has(albumId)) selectedTagIds.delete(albumId);
+  else selectedTagIds.add(albumId);
+  selectedAlbumMode = selectedTagIds.size ? 'tags' : 'all';
+
   document.querySelectorAll('.tag-card').forEach(el => {
-    el.classList.toggle('selected', String(el.dataset.albumId) === String(albumId));
+    if (el.dataset.albumId === 'all' || el.dataset.albumId === 'new') {
+      el.classList.toggle('selected', selectedAlbumMode === 'all' && el.dataset.albumId === 'all');
+    } else {
+      el.classList.toggle('selected', selectedTagIds.has(Number(el.dataset.albumId)));
+    }
   });
 }
 
 async function submitCreateSession() {
   const title = document.getElementById('new-session-title').value.trim();
-  const isAllPhotos = selectedAlbumId === 'all';
-  const isNewPhotos = selectedAlbumId === 'new';
+  const isAllPhotos = selectedAlbumMode === 'all';
+  const isNewPhotos = selectedAlbumMode === 'new';
   const includeSuggestions = document.getElementById('include-suggestions-check').checked;
   const shuffle = document.getElementById('shuffle-check').checked;
 
   if (newSessionTiers.length < 2) { toast('Нужно минимум 2 тира', 'err'); return; }
-  if (!isAllPhotos && !isNewPhotos && !selectedAlbumId) { toast('Выберите альбом', 'err'); return; }
+  if (!isAllPhotos && !isNewPhotos && !selectedTagIds.size) { toast('Выберите альбом', 'err'); return; }
 
   try {
     const body = {
       title, tiers: newSessionTiers,
       photo_filter: isAllPhotos ? 'all' : isNewPhotos ? 'new' : 'tag',
-      tag_id: (isAllPhotos || isNewPhotos) ? null : selectedAlbumId,
+      tag_ids: (isAllPhotos || isNewPhotos) ? null : [...selectedTagIds],
       include_suggestions: includeSuggestions, shuffle
     };
     const resp = await fetch(API + '/api/sessions', {
@@ -818,7 +839,7 @@ async function loadPhotos() {
     document.getElementById('photo-count-label').textContent = `(${photos.length})`;
     document.getElementById('photos-tbody').innerHTML = photos.map((p,i)=>`
       <tr>
-        <td>${i+1}</td><td><img src="/photos/${p.filename}" alt=""></td>
+        <td>${i+1}</td><td><img src="/thumbs/${p.filename}" alt=""></td>
         <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.original_name||p.filename}</td>
         <td>${p.vote_count}</td>
         <td><button class="del-btn" onclick="deletePhoto(${p.id})">✕</button></td>
@@ -864,6 +885,33 @@ async function uploadFiles(files) {
 function handleDrop(e){e.preventDefault();uploadFiles(e.dataTransfer.files);}
 function setUpProgress(p,l){document.getElementById('up-fill').style.width=p+'%';document.getElementById('up-label').textContent=l;}
 
+// Сканирует папку photos/ на сервере и регистрирует в БД файлы, которых там
+// ещё нет (если их скопировали напрямую, в обход загрузки через браузер).
+// Может занять время на большой партии — сервер в это время считает хеши
+// и гоняет автотегирование для каждого нового файла, поэтому кнопка на
+// время запроса блокируется, чтобы не запустить сканирование дважды.
+async function scanPhotosFolder() {
+  const btn = document.getElementById('scan-folder-btn');
+  const statusEl = document.getElementById('scan-folder-status');
+  btn.disabled = true; btn.textContent = 'Сканирую...';
+  statusEl.textContent = 'Ищу новые файлы и запускаю автотегирование — это может занять время...';
+  try {
+    const d = await req('POST', '/api/admin/photos/scan-folder');
+    if (d.added === 0 && d.total_found === 0) {
+      statusEl.textContent = 'Новых файлов в папке photos/ не найдено.';
+    } else {
+      statusEl.textContent = `Добавлено ${d.added} фото` +
+        (d.skipped ? `, пропущено повреждённых файлов: ${d.skipped}` : '') + '.';
+    }
+    loadPhotos();
+    loadAdminStats();
+  } catch(e) {
+    statusEl.textContent = e.message || 'Ошибка сканирования';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Просканировать папку photos/';
+  }
+}
+
 // ── TIERLIST ──────────────────────────────────────────────────────────────────
 // Cache tierlist data for export
 let tierlistData = null;
@@ -894,7 +942,7 @@ async function loadTierlist() {
         <div class="tier-photos">
           ${photos.length
             ? photos.map(p=>`<div class="tier-photo" onclick="openPhotoModal(${p.id},'${p.filename}')" title="Нажмите для просмотра">
-                <img src="/photos/${p.filename}" alt="" loading="lazy">
+                <img src="/thumbs/${p.filename}" alt="" loading="lazy">
                 <div class="score-badge" style="background:${info.color};color:${textColor}">${p.vote_count}✓</div>
               </div>`).join('')
             : '<span class="tier-empty">—</span>'}
@@ -923,7 +971,7 @@ function showTierlist() {
 // ── GALLERY (просмотр всех фото вне сессий, без оценок/тегов) ───────────────
 
 let galleryTagsCache = [];
-let gallerySelectedTagId = null;
+let gallerySelectedTagIds = new Set();
 let galleryPage = 1;
 let galleryPageSize = 30;
 let galleryTotalPages = 1;
@@ -965,6 +1013,116 @@ window.addEventListener('resize', () => {
   }, 300);
 });
 
+// ── USER PROFILE (глобальный, не завязан на сессию) ─────────────────────────
+// ── USERS DIRECTORY (список участников, доступен с главной, вне сессии) ─────
+let usersDirectoryCache = [];
+
+function showUsersDirectory() {
+  clearPolling();
+  showScreen('users-directory');
+  document.getElementById('users-directory-search').value = '';
+  loadUsersDirectory();
+}
+
+async function loadUsersDirectory() {
+  const el = document.getElementById('users-directory-list');
+  el.innerHTML = '<div class="sessions-empty">Загрузка...</div>';
+  try {
+    usersDirectoryCache = await req('GET', '/api/users');
+    renderUsersDirectory('');
+  } catch (e) {
+    el.innerHTML = `<div class="sessions-empty">Ошибка загрузки: ${e.message}</div>`;
+  }
+}
+
+function renderUsersDirectory(filterText) {
+  const el = document.getElementById('users-directory-list');
+  const q = (filterText || '').trim().toLowerCase();
+  const list = q ? usersDirectoryCache.filter(u => u.username.toLowerCase().includes(q)) : usersDirectoryCache;
+
+  if (!usersDirectoryCache.length) {
+    el.innerHTML = '<div class="sessions-empty">Пользователей пока нет.</div>';
+    return;
+  }
+  if (!list.length) {
+    el.innerHTML = `<div class="sessions-empty">По запросу «${escapeHtml(filterText)}» ничего не найдено.</div>`;
+    return;
+  }
+  el.innerHTML = list.map(u => `
+    <div class="session-card" onclick="showUserProfile(${u.id})">
+      <div class="session-card-main">
+        <div class="session-card-title">${escapeHtml(u.username)}${u.is_admin ? ' <span class="user-admin-badge">admin</span>' : ''}</div>
+      </div>
+      <span class="session-card-badge open">Профиль →</span>
+    </div>`).join('');
+}
+
+function showUserProfile(userId) {
+  if (!userId) return;
+  clearPolling();
+  showScreen('user-profile');
+  loadGlobalUserProfile(userId);
+}
+
+async function loadGlobalUserProfile(userId) {
+  const el = document.getElementById('profile-main');
+  el.innerHTML = '<div class="gp-loading">Загрузка профиля...</div>';
+  try {
+    const p = await req('GET', `/api/users/${userId}/profile`);
+    const initial = (p.username || '?').charAt(0).toUpperCase();
+    const memberSince = p.member_since ? new Date(p.member_since.replace(' ', 'T') + 'Z').toLocaleDateString('ru-RU') : '—';
+    const lastActive = p.last_active ? new Date(p.last_active.replace(' ', 'T') + 'Z').toLocaleDateString('ru-RU') : 'ещё не голосовал(а)';
+
+    const tagsHtml = p.favorite_tags.length
+      ? p.favorite_tags.map(t => `
+          <span class="gp-fav-tag ${t.is_character ? 'character' : ''}">
+            ${t.is_character ? '🎭' : '🏷️'} ${escapeHtml(t.name)} <span class="cnt">${t.count}</span>
+          </span>`).join('')
+      : '<span class="gp-fav-tag-empty">Пока нет данных — нужно проголосовать хотя бы в одной сессии</span>';
+
+    el.innerHTML = `
+      <div class="gp-header">
+        <div class="gp-avatar">${escapeHtml(initial)}</div>
+        <div>
+          <div class="gp-name-row">
+            <span class="gp-username">${escapeHtml(p.username)}</span>
+            ${p.is_admin ? '<span class="user-admin-badge">admin</span>' : ''}
+          </div>
+          <div class="gp-meta">С нами с ${memberSince} · последний голос: ${lastActive}</div>
+        </div>
+      </div>
+
+      <div class="gp-stats-grid">
+        <div class="gp-stat-card">
+          <div class="gp-stat-value">${p.total_votes}</div>
+          <div class="gp-stat-label">оценок поставлено</div>
+        </div>
+        <div class="gp-stat-card">
+          <div class="gp-stat-value">${p.sessions_participated}</div>
+          <div class="gp-stat-label">сессий с участием</div>
+        </div>
+        <div class="gp-stat-card">
+          <div class="gp-stat-value">${p.sessions_created}</div>
+          <div class="gp-stat-label">сессий создано</div>
+        </div>
+        <div class="gp-stat-card">
+          <div class="gp-stat-value">${p.tags_added}</div>
+          <div class="gp-stat-label">тегов добавлено</div>
+        </div>
+        <div class="gp-stat-card">
+          <div class="gp-stat-value">${p.top_half_pct}%</div>
+          <div class="gp-stat-label">оценок в верхней половине тиров</div>
+        </div>
+      </div>
+
+      <div class="gp-section-title">⭐ Любимые теги</div>
+      <div class="gp-fav-tags">${tagsHtml}</div>
+    `;
+  } catch (e) {
+    el.innerHTML = `<div class="gp-error">Не удалось загрузить профиль: ${e.message}</div>`;
+  }
+}
+
 function showGallery() {
   clearPolling();
   currentSessionId = null;
@@ -972,7 +1130,7 @@ function showGallery() {
   document.getElementById('gallery-nav-username').textContent = me?.username || '';
   document.getElementById('btn-publish-tierlist').style.display = me?.is_admin ? '' : 'none';
   document.querySelectorAll('.photo-manager-nav-btn').forEach(b => b.style.display = me?.is_admin ? '' : 'none');
-  gallerySelectedTagId = null;
+  gallerySelectedTagIds.clear();
   galleryPage = 1;
   document.getElementById('gallery-tag-search').value = '';
   document.getElementById('gallery-show-ai-check').checked = false;
@@ -993,7 +1151,7 @@ async function loadGalleryPhotos(direction) {
   const renderInto = async () => {
     try {
       const params = new URLSearchParams();
-      if (gallerySelectedTagId) params.set('tag_id', gallerySelectedTagId);
+      if (gallerySelectedTagIds.size) params.set('tag_ids', [...gallerySelectedTagIds].join(','));
       if (galleryShowAi()) params.set('include_suggestions', 'true');
       params.set('page', galleryPage);
       params.set('page_size', galleryPageSize);
@@ -1006,7 +1164,7 @@ async function loadGalleryPhotos(direction) {
       emptyEl.style.display = photos.length ? 'none' : '';
       grid.innerHTML = photos.map(p => `
         <div class="gallery-photo" onclick="openGalleryPhotoModal(${p.id},'${p.filename}')" title="Нажмите для просмотра">
-          <img src="/photos/${p.filename}" alt="" loading="lazy">
+          <img src="/thumbs/${p.filename}" alt="" loading="lazy">
         </div>`).join('');
 
       updateGalleryIssueBar();
@@ -1160,13 +1318,14 @@ function renderGalleryTagPanel(query) {
     return;
   }
 
-  clearBtn.style.display = gallerySelectedTagId ? '' : 'none';
-  hint.textContent = gallerySelectedTagId
-    ? galleryTagsCache.find(t => t.id === gallerySelectedTagId)?.name || ''
-    : 'Выберите тег';
+  const selectedCount = gallerySelectedTagIds.size;
+  clearBtn.style.display = selectedCount ? '' : 'none';
+  hint.textContent = selectedCount
+    ? `Выбрано тегов: ${selectedCount} (фото со всеми сразу)`
+    : 'Выберите один или несколько тегов';
 
   const chipHtml = t => `
-    <button class="tl-tag-chip ${t.id === gallerySelectedTagId ? 'active' : ''}"
+    <button class="tl-tag-chip ${gallerySelectedTagIds.has(t.id) ? 'active' : ''}"
       onclick="selectGalleryTag(${t.id})">${!t.has_confirmed ? '🤖 ' : ''}${escapeHtml(t.name)} <span style="opacity:.7">${t.photo_count}</span></button>`;
 
   const characters = visible.filter(t => t.is_character);
@@ -1180,14 +1339,17 @@ function renderGalleryTagPanel(query) {
 }
 
 function selectGalleryTag(tagId) {
-  gallerySelectedTagId = gallerySelectedTagId === tagId ? null : tagId;
+  // Тег можно выбрать несколько сразу — фильтр показывает фото, у которых
+  // есть ВСЕ выбранные теги одновременно (логика "И"), а не любой из них.
+  if (gallerySelectedTagIds.has(tagId)) gallerySelectedTagIds.delete(tagId);
+  else gallerySelectedTagIds.add(tagId);
   galleryPage = 1;
   renderGalleryTagPanel(document.getElementById('gallery-tag-search').value);
   loadGalleryPhotos();
 }
 
 function clearGalleryTagFilter() {
-  gallerySelectedTagId = null;
+  gallerySelectedTagIds.clear();
   galleryPage = 1;
   document.getElementById('gallery-tag-search').value = '';
   renderGalleryTagPanel('');
@@ -1229,7 +1391,7 @@ async function loadPublishedTierlist() {
         <div class="tier-photos">
           ${photos.length
             ? photos.map(p=>`<div class="tier-photo" onclick="openGalleryPhotoModal(${p.id},'${p.filename}')">
-                <img src="/photos/${p.filename}" alt="" loading="lazy">
+                <img src="/thumbs/${p.filename}" alt="" loading="lazy">
                 <div class="score-badge" style="background:${info.color};color:${textColor}">${p.vote_count}✓</div>
               </div>`).join('')
             : '<span class="tier-empty">—</span>'}
@@ -1538,6 +1700,7 @@ async function loadUserProfile(uid) {
           <div class="profile-name">${d.user.username}</div>
           <div class="profile-sub">Оценено фото: <b>${totalVotes}</b></div>
         </div>
+        <button class="btn-secondary" style="margin-left:auto" onclick="showUserProfile(${uid})">👤 Полный профиль</button>
       </div>
 
       <div class="stats-grid-2">
@@ -1584,7 +1747,7 @@ async function loadCompare(uid1, uid2) {
 
     const disHtml = d.disagreements.length ? d.disagreements.map(p => `
       <div class="disagree-row">
-        <img src="/photos/${p.filename}" class="disagree-img" onclick="openPhotoModal(${p.photo_id},'${p.filename}')">
+        <img src="/thumbs/${p.filename}" class="disagree-img" onclick="openPhotoModal(${p.photo_id},'${p.filename}')">
         <div class="disagree-tiers">
           <span class="modal-tier-badge" style="background:${p.color1};color:${tierTextColor(p.color1)}">${p.label1}</span>
           <span style="color:var(--muted);font-size:.8rem">vs</span>
@@ -1708,14 +1871,22 @@ function renderTags() {
 // "Персонажи" просто не появится.
 function buildTagGroupHtml(isCharacter, label) {
   const myFiltered = myTags.filter(t => !!t.is_character === isCharacter);
-  const myHtml = myFiltered.map(t => `
+  const confirmed = allPhotoTags.filter(r => !r.is_suggestion && !!r.is_character === isCharacter);
+
+  // Счётчик "сколько человек поставили тег" считаем по confirmed, чтобы он
+  // был одинаково виден и на "моих" чипах, и на чужих — раньше показывался
+  // только у чужих, из-за чего свой же вручную добавленный тег выглядел так,
+  // будто его больше никто не подтвердил, даже если это не так.
+  const myHtml = myFiltered.map(t => {
+    const count = confirmed.filter(r => r.tag_name === t.name).length;
+    return `
     <span class="tag-chip mine" title="Нажмите чтобы удалить">
-      ${t.name}
+      ${t.name} <span class="tag-users">${count}</span>
       <span class="tag-remove" onclick="removeTag(${t.id})">×</span>
-    </span>`).join('');
+    </span>`;
+  }).join('');
 
   const myTagNames = new Set(myTags.map(t => t.name));
-  const confirmed = allPhotoTags.filter(r => !r.is_suggestion && !!r.is_character === isCharacter);
   const others = {};
   confirmed.forEach(r => {
     if (!others[r.tag_name]) others[r.tag_name] = [];
