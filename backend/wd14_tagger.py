@@ -189,6 +189,15 @@ def predict_tag_ids_batch(image_paths: list[str]) -> list[list[int]]:
     на CPU это существенно быстрее суммарно для партии из многих фото, так
     как амортизирует накладные расходы на вызов модели по всей пачке сразу.
 
+    Важно: и предобработка, и сам инференс идут ПОРЦИЯМИ по BATCH_SIZE
+    изображений за раз (не грузим в память сразу все изображения партии).
+    При сканировании папки/импорте с тысячами новых файлов предобработка
+    "всё и сразу" держала бы в памяти по несколько мегабайт на каждое
+    изображение одновременно — на партии в тысячи файлов это легко уходит
+    за пределы доступной памяти сервера и роняет процесс. Потоковая обработка
+    по чанкам держит в памяти не больше одной порции сразу, независимо от
+    того, сколько всего фото в партии — хоть 50, хоть 50000.
+
     Возвращает список результатов в ТОМ ЖЕ порядке, что и image_paths;
     для файла, который не удалось прочитать как изображение, элемент —
     пустой список (а не пропуск позиции — длина результата всегда равна
@@ -200,27 +209,30 @@ def predict_tag_ids_batch(image_paths: list[str]) -> list[list[int]]:
 
     import numpy as np
 
-    # Предобработка — читаем и ресайзим каждое изображение по отдельности
-    # (это I/O + CPU-bound операция над отдельными файлами, тут батчить нечего),
-    # а вот сам проход через модель уже делаем пачками.
-    prepared = []       # (index_in_input, np.array HWC) — только успешно прочитанные
     results = [[] for _ in image_paths]
-    for i, path in enumerate(image_paths):
-        try:
-            prepared.append((i, _preprocess(path)))
-        except Exception as e:
-            print(f"[wd14_tagger] Не удалось прочитать {path}: {e}")
 
-    for chunk_start in range(0, len(prepared), BATCH_SIZE):
-        chunk = prepared[chunk_start:chunk_start + BATCH_SIZE]
+    for chunk_start in range(0, len(image_paths), BATCH_SIZE):
+        chunk_paths = image_paths[chunk_start:chunk_start + BATCH_SIZE]
+
+        # Предобработка — только текущей порции, а не всей партии разом.
+        prepared = []  # (index_in_input, np.array HWC) — только успешно прочитанные
+        for offset, path in enumerate(chunk_paths):
+            try:
+                prepared.append((chunk_start + offset, _preprocess(path)))
+            except Exception as e:
+                print(f"[wd14_tagger] Не удалось прочитать {path}: {e}")
+
+        if not prepared:
+            continue
+
         try:
-            batch_arr = np.stack([arr for _, arr in chunk], axis=0)  # (N, H, W, 3)
+            batch_arr = np.stack([arr for _, arr in prepared], axis=0)  # (N, H, W, 3)
             outputs = _session.run(None, {_input_name: batch_arr})
             probs_batch = outputs[0]  # (N, num_tags)
-            for (orig_idx, _), probs in zip(chunk, probs_batch):
+            for (orig_idx, _), probs in zip(prepared, probs_batch):
                 results[orig_idx] = _tags_from_probs(probs)
         except Exception as e:
-            print(f"[wd14_tagger] Ошибка батч-инференса ({len(chunk)} фото): {e}")
+            print(f"[wd14_tagger] Ошибка батч-инференса ({len(prepared)} фото): {e}")
             # оставляем results[...] пустыми для этого чанка — уже не хуже,
             # чем если бы автотегирование было недоступно вовсе
 

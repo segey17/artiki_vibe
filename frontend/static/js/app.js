@@ -339,7 +339,7 @@ function renderTagCardGrid(query, searchResults) {
     html += `
       <div class="tag-card ${selectedAlbumMode === 'all' ? 'selected' : ''}" data-album-id="all" onclick="selectAlbumCard('all')" title="Все фото">
         ${allPhotosPreview?.filename
-          ? `<img src="/thumbs/${allPhotosPreview.filename}" alt="" loading="lazy">`
+          ? `<img src="/photos/${allPhotosPreview.filename}" alt="" loading="lazy">`
           : `<div class="tag-card-noimg">🖼️</div>`}
         <div class="tag-card-overlay">Все фото</div>
       </div>`;
@@ -348,7 +348,7 @@ function renderTagCardGrid(query, searchResults) {
     html += `
       <div class="tag-card ${selectedAlbumMode === 'new' ? 'selected' : ''}" data-album-id="new" onclick="selectAlbumCard('new')" title="Новые фото — которых нет в опубликованном на главной тир-листе">
         ${newPhotosInfo.preview_filename
-          ? `<img src="/thumbs/${newPhotosInfo.preview_filename}" alt="" loading="lazy">`
+          ? `<img src="/photos/${newPhotosInfo.preview_filename}" alt="" loading="lazy">`
           : `<div class="tag-card-noimg">🆕</div>`}
         <span class="tag-card-ai-badge" style="background:var(--success, #2fb380)">новое</span>
         <div class="tag-card-overlay">Новые фото <span class="tag-card-count">${newPhotosInfo.count}</span></div>
@@ -358,7 +358,7 @@ function renderTagCardGrid(query, searchResults) {
   const cardHtml = t => `
     <div class="tag-card ${selectedTagIds.has(t.id) ? 'selected' : ''}" data-album-id="${t.id}" onclick="selectAlbumCard(${t.id})" title="${escapeHtml(t.name)}">
       ${t.preview_filename
-        ? `<img src="/thumbs/${t.preview_filename}" alt="" loading="lazy">`
+        ? `<img src="/photos/${t.preview_filename}" alt="" loading="lazy">`
         : `<div class="tag-card-noimg">🏷️</div>`}
       ${t.is_favorite ? '<span class="tag-card-fav-badge" title="Один из ваших любимых тегов">⭐</span>' : ''}
       ${!t.has_confirmed ? '<span class="tag-card-ai-badge">только AI</span>' : ''}
@@ -839,7 +839,7 @@ async function loadPhotos() {
     document.getElementById('photo-count-label').textContent = `(${photos.length})`;
     document.getElementById('photos-tbody').innerHTML = photos.map((p,i)=>`
       <tr>
-        <td>${i+1}</td><td><img src="/thumbs/${p.filename}" alt=""></td>
+        <td>${i+1}</td><td><img src="/photos/${p.filename}" alt=""></td>
         <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.original_name||p.filename}</td>
         <td>${p.vote_count}</td>
         <td><button class="del-btn" onclick="deletePhoto(${p.id})">✕</button></td>
@@ -894,14 +894,15 @@ async function scanPhotosFolder() {
   const btn = document.getElementById('scan-folder-btn');
   const statusEl = document.getElementById('scan-folder-status');
   btn.disabled = true; btn.textContent = 'Сканирую...';
-  statusEl.textContent = 'Ищу новые файлы и запускаю автотегирование — это может занять время...';
+  statusEl.textContent = 'Ищу новые файлы...';
   try {
     const d = await req('POST', '/api/admin/photos/scan-folder');
     if (d.added === 0 && d.total_found === 0) {
       statusEl.textContent = 'Новых файлов в папке photos/ не найдено.';
     } else {
       statusEl.textContent = `Добавлено ${d.added} фото` +
-        (d.skipped ? `, пропущено повреждённых файлов: ${d.skipped}` : '') + '.';
+        (d.skipped ? `, пропущено повреждённых файлов: ${d.skipped}` : '') +
+        '. Автотегирование запущено в фоне — теги появятся постепенно, обновлять страницу не нужно.';
     }
     loadPhotos();
     loadAdminStats();
@@ -942,7 +943,7 @@ async function loadTierlist() {
         <div class="tier-photos">
           ${photos.length
             ? photos.map(p=>`<div class="tier-photo" onclick="openPhotoModal(${p.id},'${p.filename}')" title="Нажмите для просмотра">
-                <img src="/thumbs/${p.filename}" alt="" loading="lazy">
+                <img src="/photos/${p.filename}" alt="" loading="lazy">
                 <div class="score-badge" style="background:${info.color};color:${textColor}">${p.vote_count}✓</div>
               </div>`).join('')
             : '<span class="tier-empty">—</span>'}
@@ -1164,7 +1165,7 @@ async function loadGalleryPhotos(direction) {
       emptyEl.style.display = photos.length ? 'none' : '';
       grid.innerHTML = photos.map(p => `
         <div class="gallery-photo" onclick="openGalleryPhotoModal(${p.id},'${p.filename}')" title="Нажмите для просмотра">
-          <img src="/thumbs/${p.filename}" alt="" loading="lazy">
+          <img src="/photos/${p.filename}" alt="" loading="lazy">
         </div>`).join('');
 
       updateGalleryIssueBar();
@@ -1391,7 +1392,7 @@ async function loadPublishedTierlist() {
         <div class="tier-photos">
           ${photos.length
             ? photos.map(p=>`<div class="tier-photo" onclick="openGalleryPhotoModal(${p.id},'${p.filename}')">
-                <img src="/thumbs/${p.filename}" alt="" loading="lazy">
+                <img src="/photos/${p.filename}" alt="" loading="lazy">
                 <div class="score-badge" style="background:${info.color};color:${textColor}">${p.vote_count}✓</div>
               </div>`).join('')
             : '<span class="tier-empty">—</span>'}
@@ -1747,7 +1748,7 @@ async function loadCompare(uid1, uid2) {
 
     const disHtml = d.disagreements.length ? d.disagreements.map(p => `
       <div class="disagree-row">
-        <img src="/thumbs/${p.filename}" class="disagree-img" onclick="openPhotoModal(${p.photo_id},'${p.filename}')">
+        <img src="/photos/${p.filename}" class="disagree-img" onclick="openPhotoModal(${p.photo_id},'${p.filename}')">
         <div class="disagree-tiers">
           <span class="modal-tier-badge" style="background:${p.color1};color:${tierTextColor(p.color1)}">${p.label1}</span>
           <span style="color:var(--muted);font-size:.8rem">vs</span>

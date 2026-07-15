@@ -105,13 +105,10 @@ async def websocket_endpoint(ws: WebSocket, token: Optional[str] = None, session
 
 SECRET = os.getenv("JWT_SECRET", "change-me-in-production-please")
 PHOTOS_DIR = "/app/photos"
-THUMBS_DIR = "/app/photos/_thumbs"  # уменьшенные превью для сетки/карточек — считаются лениво, по первому запросу
-THUMB_MAX_SIZE = 320  # px по длинной стороне
 DB_PATH = "/app/data/db.sqlite3"
 AUTO_TAGGER_USERNAME = "auto-tagger"  # системный "пользователь", от имени которого пишутся автотеги
 GOOGLE_DRIVE_API_KEY = os.getenv("GOOGLE_DRIVE_API_KEY", "")  # для доступа к публичным папкам Google Drive
 os.makedirs(PHOTOS_DIR, exist_ok=True)
-os.makedirs(THUMBS_DIR, exist_ok=True)
 os.makedirs("/app/data", exist_ok=True)
 
 security = HTTPBearer(auto_error=False)
@@ -609,6 +606,40 @@ async def auto_tag_photos_batch_async(new_photos: list):
         await loop.run_in_executor(None, _auto_tag_photos_batch, new_photos)
     except Exception as e:
         print(f"[auto_tag_photos_batch_async] Пропускаем автотегирование партии из {len(new_photos)} фото: {e}")
+        return
+    # Сообщаем всем открытым сейчас вкладкам, что появились новые AI-теги —
+    # без этого пришлось бы вручную обновлять страницу, чтобы их увидеть
+    # (см. обработку 'tags_updated' в connectWS на фронтенде). photo_id не
+    # указываем — партия может быть в тысячи фото, слать отдельное сообщение
+    # на каждое было бы избыточно; общего сигнала "что-то обновилось"
+    # достаточно, чтобы обновить счётчики в открытой галерее.
+    await ws_manager.broadcast({"type": "tags_updated", "photo_id": None})
+
+# Ссылки на фоновые задачи тегирования — держим здесь, чтобы Python не
+# "прибрал" задачу сборщиком мусора до её завершения (стандартная ловушка
+# asyncio.create_task: если никто не хранит ссылку на Task, он может быть
+# уничтожен раньше времени).
+_background_tagging_tasks = set()
+
+def start_background_tagging(new_photos: list):
+    """
+    Запускает автотегирование партии фото В ФОНЕ, не дожидаясь его
+    завершения — используется вместо `await auto_tag_photos_batch_async(...)`
+    во всех точках, где тегирование вызывается из обработчика HTTP-запроса
+    (импорт, загрузка, сканирование папки). При скане/импорте в тысячи фото
+    тегирование может занимать десятки минут — если ждать его внутри самого
+    запроса, соединение с браузером почти гарантированно оборвётся по
+    таймауту раньше, чем сервер успеет ответить ("Failed to fetch" на
+    стороне браузера), хотя сами фото к этому моменту уже благополучно
+    зарегистрированы в БД. Здесь же ответ уходит сразу после регистрации
+    фото, а теги появляются чуть позже — асинхронно, через WebSocket
+    (см. tags_updated) для тех, кто в этот момент смотрит галерею.
+    """
+    if not new_photos:
+        return
+    task = asyncio.create_task(auto_tag_photos_batch_async(new_photos))
+    _background_tagging_tasks.add(task)
+    task.add_done_callback(_background_tagging_tasks.discard)
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 
@@ -1211,7 +1242,7 @@ async def import_yadisk(public_url: str = Form(...), user=Depends(admin_user)):
 
     # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
     # фото всё равно уже импортированы выше.
-    await auto_tag_photos_batch_async(new_photos)
+    start_background_tagging(new_photos)
 
     return {
         "total_found": len(all_files),
@@ -1302,7 +1333,7 @@ async def yadisk_sync_once() -> dict:
 
         # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
         # фото всё равно уже синхронизированы выше.
-        await auto_tag_photos_batch_async(new_photos)
+        start_background_tagging(new_photos)
 
         if added > 0:
             await ws_manager.broadcast({"type": "photos_updated", "added": added})
@@ -1434,7 +1465,7 @@ async def import_gdrive(folder_url: str = Form(...), user=Depends(admin_user)):
 
     # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
     # фото всё равно уже импортированы выше.
-    await auto_tag_photos_batch_async(new_photos)
+    start_background_tagging(new_photos)
 
     return {
         "total_found": len(all_files),
@@ -1526,7 +1557,7 @@ async def gdrive_sync_once() -> dict:
 
         # Автотегирование WD14 — при ошибке/недоступности модели просто пропускаем,
         # фото всё равно уже синхронизированы выше.
-        await auto_tag_photos_batch_async(new_photos)
+        start_background_tagging(new_photos)
 
         if added > 0:
             await ws_manager.broadcast({"type": "photos_updated", "added": added})
@@ -1627,7 +1658,7 @@ async def upload_photos(files: list[UploadFile] = File(...), user=Depends(admin_
 
     # Автотегирование WD14 — по договорённости: при ошибке/недоступности модели
     # просто пропускаем, фото всё равно уже загружено выше.
-    await auto_tag_photos_batch_async(new_photos)
+    start_background_tagging(new_photos)
 
     return {"added": added}
 
@@ -1670,7 +1701,7 @@ async def scan_photos_folder(user=Depends(admin_user)):
         new_photos.append((cur.lastrowid, path))
     db.commit(); db.close()
 
-    await auto_tag_photos_batch_async(new_photos)
+    start_background_tagging(new_photos)
 
     return {"added": len(new_photos), "skipped": skipped, "total_found": len(candidates)}
 
@@ -1696,29 +1727,6 @@ def delete_photo(pid: int, user=Depends(admin_user)):
         db.execute("DELETE FROM photo_tags WHERE photo_id=?", (pid,))
         db.commit()
     db.close(); return {"ok": True}
-
-def generate_thumbnail(filename: str):
-    """
-    Создаёт уменьшенную копию фото (до THUMB_MAX_SIZE px по длинной стороне,
-    JPEG) в THUMBS_DIR — считается лениво, по первому запросу превью,
-    результат кэшируется на диске навсегда (пока исходный файл не удалят).
-    Раздельный от оригинала JPEG нужен, чтобы сетка/карточки не тянули
-    полноразмерные файлы там, где реально показывается миниатюра 140-320px.
-    Возвращает путь к готовому превью или None, если файл не читается как
-    изображение.
-    """
-    thumb_path = os.path.join(THUMBS_DIR, filename + ".jpg")
-    if os.path.exists(thumb_path):
-        return thumb_path
-    src_path = os.path.join(PHOTOS_DIR, filename)
-    try:
-        img = PILImage.open(src_path)
-        img = img.convert("RGB")
-        img.thumbnail((THUMB_MAX_SIZE, THUMB_MAX_SIZE), PILImage.LANCZOS)
-        img.save(thumb_path, "JPEG", quality=80)
-        return thumb_path
-    except Exception:
-        return None
 
 def compute_dhash(path: str, hash_size: int = 8):
     """
@@ -2804,26 +2812,6 @@ def compare_users(session_id: int, uid1: int, uid2: int, user=Depends(current_us
         "similarity": similarity,
         "disagreements": disagreements[:20],
     }
-
-@app.get("/thumbs/{filename}")
-def get_thumbnail(filename: str):
-    """
-    Уменьшенное превью фото — используется везде, где в интерфейсе нужна
-    маленькая миниатюра (сетка галереи, тир-лист, карточки альбомов, таблица
-    в "Управление фото"), вместо того чтобы гонять по сети полноразмерный
-    оригинал ради картинки 140-320px. Генерируется лениво при первом
-    обращении и дальше отдаётся уже готовым файлом с длинным кэшем.
-    """
-    safe_name = os.path.basename(filename)  # защита от path traversal (../..)
-    thumb_path = generate_thumbnail(safe_name)
-    if not thumb_path:
-        # не удалось прочитать как изображение — отдаём оригинал как есть,
-        # чтобы миниатюра не была просто "битой картинкой" в интерфейсе
-        orig_path = os.path.join(PHOTOS_DIR, safe_name)
-        if not os.path.exists(orig_path):
-            raise HTTPException(404, "Фото не найдено")
-        return FileResponse(orig_path)
-    return FileResponse(thumb_path, headers={"Cache-Control": "public, max-age=604800, immutable"})
 
 app.mount("/photos", StaticFiles(directory=PHOTOS_DIR), name="photos")
 app.mount("/static", StaticFiles(directory="/app/frontend/static"), name="static")
